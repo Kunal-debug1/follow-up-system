@@ -1,0 +1,22 @@
+# Environment and local runtime data
+.env
+.env.*
+!.env.example
+backend/crm.db
+backend/crm.db-*
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.DS_Store

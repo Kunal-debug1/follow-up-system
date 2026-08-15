@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: crm-follow-up-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: CRM_ADMIN_USERNAME
+        sync: false
+      - key: CRM_ADMIN_PASSWORD
+        sync: false
+      - key: CRM_AUTH_SECRET
+        generateValue: true
+      - key: CORS_ORIGINS
+        sync: false
+
+  - type: web
+    name: crm-follow-up-web
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        sync: false
+
+  - type: cron
+    name: crm-api-keepalive
+    runtime: python
+    schedule: "*/10 * * * *"
+    buildCommand: pip install httpx
+    startCommand: python -c "import os,httpx; httpx.get(os.environ['BACKEND_HEALTH_URL'], timeout=20).raise_for_status()"
+    envVars:
+      - key: BACKEND_HEALTH_URL
+        sync: false
