@@ -16,6 +16,9 @@ engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     pool_recycle=300,
+    pool_size=int(os.getenv("DB_POOL_SIZE", "3")),
+    max_overflow=0,
+    pool_timeout=30,
 )
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
