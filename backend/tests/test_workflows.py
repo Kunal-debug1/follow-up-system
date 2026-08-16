@@ -40,3 +40,16 @@ def test_auth_health_and_customer_followup_workflow():
     followup_id = followup.json()["id"]
     assert client.patch(f"/api/followups/{followup_id}", json={"status": "completed"}).status_code == 200
     assert client.get(f"/api/customers?search=Test+Customer").json()["total"] == 1
+
+
+def test_csv_import_and_live_frontend_cors_origin():
+    client = client_with_token()
+    response = client.post(
+        "/api/import/import",
+        files={"file": ("customers.csv", b"Customer Name,Mobile Number,Consumer Number\nAsha,9876543210,C-100\n", "text/csv")},
+        headers={"Origin": "https://follow-up-system-1.onrender.com"},
+    )
+    assert response.status_code == 200
+    assert response.json()["imported_rows"] == 1
+    assert response.headers["access-control-allow-origin"] == "https://follow-up-system-1.onrender.com"
+
