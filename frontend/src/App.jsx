@@ -38,7 +38,7 @@ const CALL_STATUSES = [
 ];
 
 function formatDate(value) {
-  if (!value) return "—";
+  if (!value) return "â€”";
   return new Date(`${value}T00:00:00`).toLocaleDateString("en-IN", {
     day: "2-digit",
     month: "short",
@@ -47,12 +47,12 @@ function formatDate(value) {
 }
 function displayPhone(phone) {
   if (phone === null || phone === undefined) {
-    return "—";
+    return "â€”";
   }
 
   const value = String(phone).trim();
 
-  return value || "—";
+  return value || "â€”";
 }
 
 function StatusPill({ status }) {
@@ -580,10 +580,10 @@ function Dashboard({ loading, stats, today, upcoming, customers, onCustomer, onF
       </section>
 
       <section className="stat-grid">
-        <StatCard icon={Users} label="Total customers" value={loading ? "…" : stats.total_customers.toLocaleString()} />
-        <StatCard icon={Clock3} label="Today's follow-ups" value={loading ? "…" : stats.today_followups} />
-        <StatCard icon={AlertCircle} label="Overdue follow-ups" value={loading ? "…" : stats.overdue_followups} />
-        <StatCard icon={CalendarClock} label="Next 7 days" value={loading ? "…" : stats.upcoming_followups} />
+        <StatCard icon={Users} label="Total customers" value={loading ? "â€¦" : stats.total_customers.toLocaleString()} />
+        <StatCard icon={Clock3} label="Today's follow-ups" value={loading ? "â€¦" : stats.today_followups} />
+        <StatCard icon={AlertCircle} label="Overdue follow-ups" value={loading ? "â€¦" : stats.overdue_followups} />
+        <StatCard icon={CalendarClock} label="Next 7 days" value={loading ? "â€¦" : stats.upcoming_followups} />
       </section>
 
       <section className="content-grid">
@@ -654,7 +654,7 @@ function CustomersPage({
           <div className="search-box wide"><Search size={18} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search name, phone, consumer number, email..." /></div>
           <button className="button primary" onClick={onCreateCustomer}><Plus size={16} /> Add Customer</button>
         </div>
-        {loading && customers.length === 0 ? <div className="loading">Loading customers…</div> : customers.length === 0 ? (
+        {loading && customers.length === 0 ? <div className="loading">Loading customersâ€¦</div> : customers.length === 0 ? (
           <EmptyState icon={Users} title="No customers found" text="Try a different search." />
         ) : (
           <>
@@ -695,11 +695,11 @@ function CustomerTable({ customers, onCustomer }) {
                     {displayPhone(c.phone)}
                   </a>
                 ) : (
-                  <span className="muted-text">—</span>
+                  <span className="muted-text">â€”</span>
                 )}
               </td>
-              <td>{c.consumer_number || "—"}</td>
-              <td>{c.region || c.zone || "—"}</td>
+              <td>{c.consumer_number || "â€”"}</td>
+              <td>{c.region || c.zone || "â€”"}</td>
               <td><StatusPill status={c.status} /></td>
               <td><button className="row-action" onClick={() => onCustomer(c)}><ChevronRight size={17} /></button></td>
             </tr>
@@ -763,10 +763,10 @@ function FollowupList({ items, onCustomer, onComplete }) {
       {items.map((item) => {
         return (
           <div className="followup-row" key={item.id}>
-            <div className="time-block"><strong>{item.followup_time || "—"}</strong><span>{formatDate(item.followup_date)}</span></div>
+            <div className="time-block"><strong>{item.followup_time || "â€”"}</strong><span>{formatDate(item.followup_date)}</span></div>
             <div className="followup-main">
               <button onClick={() => onCustomer({ id: item.customer_id })}><strong>{item.customer_name || `Customer #${item.customer_id}`}</strong></button>
-              <span>{item.reason || "Follow-up"}{item.notes ? ` · ${item.notes}` : ""}</span>
+              <span>{item.reason || "Follow-up"}{item.notes ? ` Â· ${item.notes}` : ""}</span>
             </div>
             {onComplete && <button className="complete-button" onClick={() => onComplete(item.id)} title="Mark completed"><CheckCircle2 size={18} /></button>}
           </div>
@@ -916,13 +916,13 @@ function ImportPage() {
             >
               <input
                 type="file"
-                accept=".csv,.xlsx,.xls"
+                accept=".csv,.xlsx"
                 onChange={(e) => chooseFile(e.target.files?.[0])}
               />
               <div className="import-icon"><FileSpreadsheet size={30} /></div>
               <strong>Drop your customer file here</strong>
               <span>or click to browse</span>
-              <small>CSV, XLSX or XLS</small>
+              <small>CSV or XLSX, up to 12 MB</small>
             </label>
           )}
 
@@ -979,8 +979,8 @@ function ImportPage() {
 
               <div className="analysis-stats">
                 <AnalysisStat label="Rows" value={analysis.total_rows ?? 0} />
-                <AnalysisStat label="Header row" value={analysis.header_row ?? "—"} />
-                <AnalysisStat label="Sheet" value={analysis.selected_sheet || selectedSheet || "—"} />
+                <AnalysisStat label="Header row" value={analysis.header_row ?? "â€”"} />
+                <AnalysisStat label="Sheet" value={analysis.selected_sheet || selectedSheet || "â€”"} />
                 <AnalysisStat label="Required missing" value={analysis.missing_required?.length ?? 0} />
               </div>
 
@@ -988,7 +988,7 @@ function ImportPage() {
                 {Object.entries(analysis.detected_mapping || {}).map(([key, value]) => (
                   <div className="mapping-item" key={key}>
                     <span>{key.replaceAll("_", " ")}</span>
-                    <strong>{Array.isArray(value) ? value.join(", ") : value || "—"}</strong>
+                    <strong>{Array.isArray(value) ? value.join(", ") : value || "â€”"}</strong>
                   </div>
                 ))}
               </div>
@@ -1027,9 +1027,9 @@ function ImportPage() {
               </div>
 
               <div className="preview-summary">
-                <AnalysisStat label="Total rows" value={previewSummary.valid_records ?? preview.total_rows ?? preview.total ?? "—"} />
-                <AnalysisStat label="New records" value={previewSummary.new_records ?? preview.new_count ?? "—"} />
-                <AnalysisStat label="Already in DB" value={previewSummary.already_in_database ?? preview.duplicates ?? "—"} />
+                <AnalysisStat label="Total rows" value={previewSummary.valid_records ?? preview.total_rows ?? preview.total ?? "â€”"} />
+                <AnalysisStat label="New records" value={previewSummary.new_records ?? preview.new_count ?? "â€”"} />
+                <AnalysisStat label="Already in DB" value={previewSummary.already_in_database ?? preview.duplicates ?? "â€”"} />
                 <AnalysisStat label="Shown" value={(preview.rows || preview.preview || []).length} />
               </div>
 
@@ -1071,7 +1071,7 @@ function ImportPage() {
 function ImportStep({ number, label, active, done }) {
   return (
     <div className={`import-step ${active ? "active" : ""} ${done ? "done" : ""}`}>
-      <span>{done ? "✓" : number}</span>
+      <span>{done ? "âœ“" : number}</span>
       <strong>{label}</strong>
     </div>
   );
@@ -1107,7 +1107,7 @@ function PreviewTable({ data }) {
                <tr key={index}>
               {columns.map((column) => (
                 <td key={column} title={String(row?.[column] ?? "")}>
-                  {String(row?.[column] ?? "—")}
+                  {String(row?.[column] ?? "â€”")}
                 </td>
               ))}
             </tr>
@@ -1154,7 +1154,7 @@ function CustomerDrawer({ customer, calls, followups, onClose, onCall, onFollowu
                 {customer.phone}
               </a>
             ) : (
-              <strong>—</strong>
+              <strong>â€”</strong>
             )}
           </div>
           <Detail label="Email" value={customer.email} />
@@ -1173,7 +1173,7 @@ function CustomerDrawer({ customer, calls, followups, onClose, onCall, onFollowu
           <div className="section-heading"><div><h3>Follow-ups</h3><span>Scheduled callbacks</span></div></div>
           {followups.length ? followups.map((f) => (
             <div className="history-row" key={f.id}>
-              <div><strong>{formatDate(f.followup_date)} {f.followup_time || ""}</strong><span>{f.reason || "Follow-up"}{f.notes ? ` · ${f.notes}` : ""}</span></div>
+              <div><strong>{formatDate(f.followup_date)} {f.followup_time || ""}</strong><span>{f.reason || "Follow-up"}{f.notes ? ` Â· ${f.notes}` : ""}</span></div>
               {f.status === "pending" && <button className="complete-button" onClick={() => onComplete(f.id)}><CheckCircle2 size={18} /></button>}
             </div>
           )) : <span className="muted-text">No follow-ups yet.</span>}
@@ -1193,7 +1193,7 @@ function CustomerDrawer({ customer, calls, followups, onClose, onCall, onFollowu
 }
 
 function Detail({ label, value, wide }) {
-  return <div className={wide ? "detail wide" : "detail"}><span>{label}</span><strong>{value || "—"}</strong></div>;
+  return <div className={wide ? "detail wide" : "detail"}><span>{label}</span><strong>{value || "â€”"}</strong></div>;
 }
 
 function Modal({ title, onClose, children }) {
@@ -1311,3 +1311,4 @@ function CustomerFormModal({ onClose, onSuccess }) {
 }
 
 export default App;
+
