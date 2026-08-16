@@ -1038,7 +1038,7 @@ function ImportPage() {
               <div className="import-action-row confirm-row">
                 <div>
                   <strong>Everything look good?</strong>
-                  <span>Confirm to save the imported records to SQLite.</span>
+                  <span>Confirm to save the imported records to the database.</span>
                 </div>
                 <button className="button primary" onClick={confirmImport} disabled={busy}>
                   {busy ? "Importing..." : "Confirm & import"}
