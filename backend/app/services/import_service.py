@@ -1,1253 +1,300 @@
 from __future__ import annotations
 
+import csv
 import re
-from io import BytesIO
-from typing import Any
+from itertools import islice
+from pathlib import Path
+from time import monotonic
+from typing import Any, Iterable, Iterator
 
-import pandas as pd
+from openpyxl import load_workbook
 from sqlalchemy.orm import Session
 
 from ..models import Customer, ImportBatch
 
+MAX_WORKSHEET_ROWS = 50_000
+MAX_COLUMNS = 80
+MAX_HEADER_SCAN_ROWS = 30
+MAX_SAMPLE_ROWS = 100
+IMPORT_BATCH_SIZE = 250
 
-# ============================================================
-# COLUMN MAPPING
-# ============================================================
-
-FIELD_ALIASES: dict[str, list[str]] = {
-    "name": [
-        "name",
-        "customer name",
-        "customer_name",
-        "consumer name",
-        "consumer_name",
-        "client name",
-        "full name",
-    ],
-    "phone": [
-        "phone",
-        "mobile",
-        "mobile number",
-        "contact",
-        "contact no",
-        "contact number",
-        "contact_no",
-        "phone number",
-        "telephone",
-    ],
-    "email": [
-        "email",
-        "email address",
-        "e-mail",
-        "email_id",
-    ],
-    "consumer_number": [
-        "consumer number",
-        "consumer_number",
-        "consumer no",
-        "consumer id",
-        "account number",
-        "account no",
-    ],
-    "service": [
-        "service",
-        "product",
-        "service name",
-    ],
-    "region": [
-        "region",
-        "region name",
-        "region_name",
-    ],
-    "zone": [
-        "zone",
-        "zone name",
-        "zone_name",
-    ],
-    "circle": [
-        "circle",
-        "circle name",
-        "circle_name",
-    ],
-    "division": [
-        "division",
-        "division name",
-        "division_name",
-    ],
-    "subdivision": [
-        "subdivision",
-        "sub division",
-        "subdivision name",
-        "subdivision_name",
-    ],
-    "business_unit": [
-        "bu",
-        "business unit",
-        "business_unit",
-    ],
+FIELD_ALIASES = {
+    "name": ("name", "customer name", "consumer name", "client name", "full name"),
+    "phone": ("phone", "mobile", "mobile number", "contact", "contact no", "contact number", "phone number", "telephone"),
+    "email": ("email", "email address", "e mail"),
+    "consumer_number": ("consumer number", "consumer no", "consumer id", "account number", "account no"),
+    "service": ("service", "product", "service name", "requirement", "trf desc"),
+    "region": ("region", "region name"),
+    "zone": ("zone", "zone name"),
+    "circle": ("circle", "circle name"),
+    "division": ("division", "division name"),
+    "subdivision": ("subdivision", "sub division", "subdivision name"),
+    "business_unit": ("bu", "business unit"),
 }
+CUSTOMER_FIELDS = ("name", "phone", "email", "service", "consumer_number", "address", "region", "zone", "circle", "division", "subdivision", "business_unit")
 
-
-# ============================================================
-# BASIC CLEANING
-# ============================================================
 
 def normalize_column(value: Any) -> str:
-    """
-    Convert a column name into a predictable comparison format.
-
-    Example:
-        "Consumer_Number" -> "consumer number"
-        "EMAIL_ID"       -> "email id"
-    """
-    text = str(value).strip().lower()
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(value).strip().lower())).strip()
 
 
 def clean_value(value: Any) -> str | None:
-    """
-    Convert Excel/Pandas values into clean strings.
-
-    Handles:
-    - NaN
-    - None
-    - empty strings
-    - Excel numeric values ending in .0
-    - meaningless zero placeholders
-    """
     if value is None:
         return None
-
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-
     text = str(value).strip()
-
-    if not text:
+    if not text or text.lower() in {"nan", "none", "null", "nat", "<na>"}:
         return None
-
-    if text.lower() in {
-        "nan",
-        "none",
-        "null",
-        "nat",
-        "<na>",
-    }:
-        return None
-
-    # Excel may convert values such as 12345 into "12345.0".
     if text.endswith(".0") and text[:-2].isdigit():
         text = text[:-2]
-
-    # Ignore meaningless address placeholders like:
-    # 000000000000000000000000
-    compact = re.sub(r"\s+", "", text)
-
-    if re.fullmatch(r"0{8,}", compact):
+    if re.fullmatch(r"0{8,}", re.sub(r"\s+", "", text)):
         return None
-
     return text
 
 
-# ============================================================
-# HEADER DETECTION
-# ============================================================
-
-def find_header_row(
-    raw: pd.DataFrame,
-    max_rows: int = 30,
-) -> int:
-    """
-    Automatically detect the Excel header row.
-
-    This is important because the source workbook can have
-    title/information rows before the actual table header.
-    """
-
-    best_row = 0
-    best_score = -1
-
-    keywords = [
-        "consumer number",
-        "consumer name",
-        "contact",
-        "phone",
-        "mobile",
-        "region name",
-        "zone name",
-        "division name",
-        "email",
-        "address",
-    ]
-
-    rows_to_check = min(max_rows, len(raw))
-
-    for row_index in range(rows_to_check):
-        values = [
-            normalize_column(value)
-            for value in raw.iloc[row_index].tolist()
-            if pd.notna(value)
-        ]
-
-        if not values:
-            continue
-
-        joined = " | ".join(values)
-
-        score = sum(
-            2
-            for keyword in keywords
-            if keyword in joined
-        )
-
-        # Strong indicators.
-        if "consumer number" in joined:
-            score += 5
-
-        if "consumer name" in joined:
-            score += 5
-
-        if score > best_score:
-            best_score = score
-            best_row = row_index
-
-    return best_row
-
-
-# ============================================================
-# FILE LOADERS
-# ============================================================
-
-def load_excel_sheet(
-    content: bytes,
-    sheet_name: str | int = 0,
-) -> tuple[pd.DataFrame, int]:
-    """
-    Load an Excel sheet and automatically detect its header row.
-    """
-
-    raw = pd.read_excel(
-        BytesIO(content),
-        sheet_name=sheet_name,
-        header=None,
-        dtype=str,
-    )
-
-    if raw.empty:
-        raise ValueError("The selected Excel sheet is empty.")
-
-    header_row = find_header_row(raw)
-
-    headers: list[str] = []
-
-    for index, value in enumerate(
-        raw.iloc[header_row].tolist()
-    ):
-        header = clean_value(value)
-
-        if header:
-            headers.append(header)
-        else:
-            headers.append(f"Unnamed: {index}")
-
-    df = raw.iloc[header_row + 1:].copy()
-
-    df.columns = headers
-
-    # Preserve the original Excel row number.
-    df["_source_excel_row"] = range(
-        header_row + 2,
-        header_row + 2 + len(df),
-    )
-
-    # Remove completely empty rows.
-    df = (
-        df
-        .dropna(how="all")
-        .reset_index(drop=True)
-    )
-
-    return df, header_row
-
-
-def load_csv(
-    content: bytes,
-) -> tuple[pd.DataFrame, int]:
-    """
-    Load CSV data.
-    """
-
-    df = pd.read_csv(
-        BytesIO(content),
-        dtype=str,
-    )
-
-    df["_source_excel_row"] = range(
-        2,
-        2 + len(df),
-    )
-
-    return df, 0
-
-
-# ============================================================
-# COLUMN DETECTION
-# ============================================================
-
-def detect_columns(
-    columns: list[str],
-    df: pd.DataFrame | None = None,
-) -> dict[str, Any]:
-    """
-    Automatically map source columns to CRM fields.
-    """
-
-    normalized_columns = {
-        column: normalize_column(column)
-        for column in columns
-    }
-
-    detected: dict[str, Any] = {}
-
-    # --------------------------------------------------------
-    # Standard aliases
-    # --------------------------------------------------------
-
-    for field, aliases in FIELD_ALIASES.items():
-        alias_set = {
-            normalize_column(alias)
-            for alias in aliases
-        }
-
-        for original, normalized in normalized_columns.items():
-            if normalized in alias_set:
-                detected[field] = original
-                break
-
-    # --------------------------------------------------------
-    # Exact source-file overrides
-    # --------------------------------------------------------
-
-    overrides = {
-        "name": ["consumer_name"],
-        "consumer_number": ["consumer_number"],
-        "region": ["region_name"],
-        "zone": ["zone_name"],
-        "circle": ["circle_name"],
-        "division": ["division_name"],
-        "subdivision": ["subdivision_name"],
-        "business_unit": ["bu"],
-        "email": ["email_id"],
-    }
-
-    for field, candidates in overrides.items():
-        candidate_set = {
-            normalize_column(candidate)
-            for candidate in candidates
-        }
-
-        for original in columns:
-            if normalize_column(original) in candidate_set:
-                detected[field] = original
-                break
-
-    # --------------------------------------------------------
-    # Detect blank-header phone column.
-    #
-    # Your Excel file contains a phone column represented by
-    # something similar to "Unnamed: 11".
-    #
-    # We inspect the values instead of relying on the header.
-    # --------------------------------------------------------
-
-    if "phone" not in detected and df is not None:
-        for original in columns:
-
-            normalized = normalize_column(original)
-
-            if not normalized.startswith("unnamed"):
-                continue
-
-            sample = (
-                df[original]
-                .dropna()
-                .astype(str)
-                .str.strip()
-                .head(200)
-            )
-
-            if len(sample) < 5:
-                continue
-
-            digits = sample.str.replace(
-                r"\D",
-                "",
-                regex=True,
-            )
-
-            valid_ratio = (
-                (digits.str.len() == 10).mean()
-            )
-
-            if valid_ratio >= 0.60:
-                detected["phone"] = original
-                break
-
-    # --------------------------------------------------------
-    # Address columns
-    # --------------------------------------------------------
-
-    address_names = {
-        "address",
-        "address 1",
-        "address 2",
-        "address 3",
-        "address l1",
-        "address l2",
-        "address l3",
-    }
-
-    address_columns = [
-        column
-        for column in columns
-        if normalize_column(column) in address_names
-    ]
-
-    if address_columns:
-        detected["address_columns"] = address_columns
-
-    return detected
-
-
-# ============================================================
-# ANALYSIS
-# ============================================================
-
-def analyze_dataframe(
-    df: pd.DataFrame,
-    header_row: int = 0,
-) -> dict:
-    """
-    Analyze an imported dataframe and return the detected
-    CRM column mapping.
-    """
-
-    columns = [
-        str(column)
-        for column in df.columns
-        if str(column) != "_source_excel_row"
-    ]
-
-    mapping = detect_columns(
-        columns,
-        df,
-    )
-
-    return {
-        "total_rows": int(len(df)),
-        "columns": columns,
-        "header_row": header_row + 1,
-        "detected_mapping": mapping,
-        "missing_required": (
-            []
-            if "name" in mapping
-            else ["name"]
-        ),
-    }
-
-
-# ============================================================
-# ADDRESS
-# ============================================================
-
-def build_address(
-    row: pd.Series,
-    mapping: dict[str, Any],
-) -> str | None:
-    """
-    Combine address columns into one clean address.
-    """
-
-    parts: list[str] = []
-
-    # Single address column.
-    address_column = mapping.get("address")
-
-    if address_column:
-        value = clean_value(
-            row.get(address_column)
-        )
-
-        if value:
-            parts.append(value)
-
-    # Multiple address columns.
-    for column in mapping.get(
-        "address_columns",
-        [],
-    ):
-        value = clean_value(
-            row.get(column)
-        )
-
-        if value and value not in parts:
-            parts.append(value)
-
-    return (
-        ", ".join(parts)
-        if parts
-        else None
-    )
-
-
-# ============================================================
-# PHONE
-# ============================================================
-
-def normalize_phone(
-    value: str | None,
-) -> str | None:
-    """
-    Normalize Indian mobile numbers.
-
-    Supported:
-        9423149619
-        +919423149619
-        919423149619
-        09423149619
-
-    Returns:
-        A clean 10-digit mobile number, or None.
-    """
+def normalize_phone(value: str | None) -> str | None:
     if not value:
         return None
-
-    digits = re.sub(r"\D", "", str(value))
-
-    if not digits:
-        return None
-
+    digits = re.sub(r"\D", "", value)
     if len(digits) == 12 and digits.startswith("91"):
         digits = digits[2:]
     elif len(digits) == 11 and digits.startswith("0"):
         digits = digits[1:]
-
-    if len(digits) == 10 and digits[0] in "6789":
-        return digits
-
-    return None
+    return digits if len(digits) == 10 and digits[0] in "6789" else None
 
 
-# ============================================================
-# RECORD PREPARATION
-# ============================================================
+def _bounded_rows(rows: Iterable[tuple[Any, ...]]) -> Iterator[tuple[int, tuple[Any, ...]]]:
+    for number, row in enumerate(rows, start=1):
+        if number > MAX_WORKSHEET_ROWS:
+            raise ValueError(f"Worksheet exceeds the {MAX_WORKSHEET_ROWS:,}-row safety limit.")
+        yield number, tuple(row[:MAX_COLUMNS])
 
-def prepare_import(
-    df: pd.DataFrame,
-    mapping: dict[str, Any],
-    sheet_name: str | None = None,
-) -> list[dict]:
-    """
-    Convert dataframe rows into CRM customer records.
-    """
 
-    records: list[dict] = []
+def workbook_sheets(path: Path) -> list[str]:
+    try:
+        with load_workbook(path, read_only=True, data_only=True, keep_links=False) as workbook:
+            return list(workbook.sheetnames)
+    except Exception as exc:
+        raise ValueError("Could not read XLSX workbook.") from exc
 
-    for index, (_, row) in enumerate(
-        df.iterrows(),
-        start=0,
-    ):
 
-        name = (
-            clean_value(
-                row.get(mapping["name"])
-            )
-            if mapping.get("name")
-            else None
-        )
+def _sheet_rows(path: Path, sheet_name: str) -> Iterator[tuple[int, tuple[Any, ...]]]:
+    try:
+        with load_workbook(path, read_only=True, data_only=True, keep_links=False) as workbook:
+            if sheet_name not in workbook.sheetnames:
+                raise ValueError("Selected sheet does not exist.")
+            worksheet = workbook[sheet_name]
+            yield from _bounded_rows(worksheet.iter_rows(values_only=True))
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Could not parse XLSX worksheet.") from exc
 
-        phone = (
-            clean_value(
-                row.get(mapping["phone"])
-            )
-            if mapping.get("phone")
-            else None
-        )
 
-        email = (
-            clean_value(
-                row.get(mapping["email"])
-            )
-            if mapping.get("email")
-            else None
-        )
+def _csv_rows(path: Path) -> Iterator[tuple[int, tuple[Any, ...]]]:
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            yield from _bounded_rows(csv.reader(handle))
+    except UnicodeDecodeError as exc:
+        raise ValueError("CSV must be UTF-8 encoded.") from exc
+    except csv.Error as exc:
+        raise ValueError("Could not parse CSV file.") from exc
 
-        # Ignore completely unusable rows.
+
+def _header_score(row: tuple[Any, ...]) -> int:
+    text = " | ".join(normalize_column(value) for value in row if clean_value(value))
+    keywords = ("consumer number", "consumer name", "customer name", "contact", "phone", "mobile", "email", "address")
+    return sum(2 for item in keywords if item in text) + (5 if "consumer number" in text else 0) + (5 if "consumer name" in text else 0)
+
+
+def _scan_source(path: Path, file_type: str, sheet_name: str | None) -> tuple[list[tuple[int, tuple[Any, ...]]], str | None]:
+    if file_type == "xlsx":
+        if sheet_name is None:
+            sheet_name = workbook_sheets(path)[0] if workbook_sheets(path) else None
+        if not sheet_name:
+            raise ValueError("Workbook contains no worksheets.")
+        source = _sheet_rows(path, sheet_name)
+    else:
+        source = _csv_rows(path)
+    rows = []
+    for row in source:
+        rows.append(row)
+        if len(rows) >= MAX_HEADER_SCAN_ROWS + MAX_SAMPLE_ROWS:
+            break
+    return rows, sheet_name
+
+
+def _headers_and_mapping(scanned: list[tuple[int, tuple[Any, ...]]]) -> tuple[int, list[str], dict[str, Any]]:
+    if not scanned:
+        raise ValueError("The selected sheet is empty.")
+    header_number, header_values = max(scanned[:MAX_HEADER_SCAN_ROWS], key=lambda item: _header_score(item[1]))
+    if not any(clean_value(value) for value in header_values):
+        raise ValueError("The selected sheet is empty.")
+    headers = [clean_value(value) or f"Unnamed: {index}" for index, value in enumerate(header_values)]
+    normalized = {header: normalize_column(header) for header in headers}
+    mapping: dict[str, Any] = {}
+    for field, aliases in FIELD_ALIASES.items():
+        aliases_normalized = {normalize_column(alias) for alias in aliases}
+        for header, value in normalized.items():
+            if value in aliases_normalized:
+                mapping[field] = header
+                break
+    # Exact source headings used by existing customer workbooks.
+    for field, source in {"name": "consumer_name", "consumer_number": "consumer_number", "email": "email_id", "service": "trf_desc", "region": "region_name", "zone": "zone_name", "circle": "circle_name", "division": "division_name", "subdivision": "subdivision_name", "business_unit": "bu"}.items():
+        for header, value in normalized.items():
+            if value == normalize_column(source):
+                mapping[field] = header
+                break
+    address_columns = [header for header, value in normalized.items() if value in {"address", "address 1", "address 2", "address 3", "address l1", "address l2", "address l3"}]
+    if address_columns:
+        mapping["address_columns"] = address_columns
+    return header_number, headers, mapping
+
+
+def analyze_file(path: Path, file_type: str, sheet_name: str | None = None) -> dict:
+    scanned, selected_sheet = _scan_source(path, file_type, sheet_name)
+    header_row, headers, mapping = _headers_and_mapping(scanned)
+    sample_rows = max(0, len(scanned) - next((i for i, item in enumerate(scanned) if item[0] == header_row), len(scanned)) - 1)
+    return {"total_rows": sample_rows, "columns": headers, "header_row": header_row, "detected_mapping": mapping, "missing_required": [] if "name" in mapping else ["name"], "selected_sheet": selected_sheet}
+
+
+def iter_records(path: Path, file_type: str, sheet_name: str | None, mapping: dict[str, Any]) -> Iterator[dict]:
+    source: Iterable[tuple[int, tuple[Any, ...]]]
+    if file_type == "xlsx":
+        if not sheet_name:
+            raise ValueError("A worksheet must be selected.")
+        source = _sheet_rows(path, sheet_name)
+    else:
+        source = _csv_rows(path)
+    rows = iter(source)
+    initial = list(islice(rows, MAX_HEADER_SCAN_ROWS))
+    if not initial:
+        return
+    header_number, headers, _ = _headers_and_mapping(initial)
+    start_index = next(i for i, item in enumerate(initial) if item[0] == header_number) + 1
+    row_stream = iter(initial[start_index:])
+    def remaining():
+        yield from row_stream
+        yield from rows
+    for number, values in remaining():
+        row = {headers[index]: values[index] if index < len(values) else None for index in range(len(headers))}
+        name = clean_value(row.get(mapping.get("name", "")))
+        phone = clean_value(row.get(mapping.get("phone", "")))
         if not name and not phone:
             continue
-
-        source_row = row.get(
-            "_source_excel_row"
-        )
-
-        try:
-            if pd.isna(source_row):
-                source_row = index + 2
-        except (TypeError, ValueError):
-            source_row = index + 2
-
-        record = {
-            "name": name or "Unknown",
-            "phone": normalize_phone(phone),
-            "email": email,
-
-            "service": (
-                clean_value(
-                    row.get(mapping["service"])
-                )
-                if mapping.get("service")
-                else None
-            ),
-
-            "consumer_number": (
-                clean_value(
-                    row.get(
-                        mapping["consumer_number"]
-                    )
-                )
-                if mapping.get("consumer_number")
-                else None
-            ),
-
-            "address": build_address(
-                row,
-                mapping,
-            ),
-
-            "region": (
-                clean_value(
-                    row.get(mapping["region"])
-                )
-                if mapping.get("region")
-                else None
-            ),
-
-            "zone": (
-                clean_value(
-                    row.get(mapping["zone"])
-                )
-                if mapping.get("zone")
-                else None
-            ),
-
-            "circle": (
-                clean_value(
-                    row.get(mapping["circle"])
-                )
-                if mapping.get("circle")
-                else None
-            ),
-
-            "division": (
-                clean_value(
-                    row.get(mapping["division"])
-                )
-                if mapping.get("division")
-                else None
-            ),
-
-            "subdivision": (
-                clean_value(
-                    row.get(
-                        mapping["subdivision"]
-                    )
-                )
-                if mapping.get("subdivision")
-                else None
-            ),
-
-            "business_unit": (
-                clean_value(
-                    row.get(
-                        mapping["business_unit"]
-                    )
-                )
-                if mapping.get("business_unit")
-                else None
-            ),
-
-            "source_row": int(source_row),
-        }
-
-        records.append(record)
-
-    return records
+        address = ", ".join(dict.fromkeys(value for column in mapping.get("address_columns", []) if (value := clean_value(row.get(column))))) or None
+        yield {"name": name or "Unknown", "phone": normalize_phone(phone), "email": clean_value(row.get(mapping.get("email", ""))), "service": clean_value(row.get(mapping.get("service", ""))), "consumer_number": clean_value(row.get(mapping.get("consumer_number", ""))), "address": address, "region": clean_value(row.get(mapping.get("region", ""))), "zone": clean_value(row.get(mapping.get("zone", ""))), "circle": clean_value(row.get(mapping.get("circle", ""))), "division": clean_value(row.get(mapping.get("division", ""))), "subdivision": clean_value(row.get(mapping.get("subdivision", ""))), "business_unit": clean_value(row.get(mapping.get("business_unit", ""))), "source_row": number}
 
 
-# ============================================================
-# DUPLICATE / UPDATE PREVIEW
-# ============================================================
-
-def load_customers_by_consumer_number(
-    db: Session,
-    consumer_numbers: set[str],
-) -> dict[str, Customer]:
-    """Load each matching customer once, keyed by consumer number."""
-    if not consumer_numbers:
+def _load_by_consumer(db: Session, values: set[str]) -> dict[str, Customer]:
+    if not values:
         return {}
-
-    customers: dict[str, Customer] = {}
-
-    for customer in (
-        db.query(Customer)
-        .filter(Customer.consumer_number.in_(consumer_numbers))
-        .order_by(Customer.id.asc())
-        .all()
-    ):
-        if customer.consumer_number:
-            customers.setdefault(customer.consumer_number, customer)
-
-    return customers
+    return {customer.consumer_number: customer for customer in db.query(Customer).filter(Customer.consumer_number.in_(values)).order_by(Customer.id).all() if customer.consumer_number}
 
 
-def load_customers_by_phone_and_name(
-    db: Session,
-    phones: set[str],
-) -> dict[tuple[str, str], Customer]:
-    """Load possible fallback matches once, preserving first-match behavior."""
+def _load_by_phone_name(db: Session, phones: set[str]) -> dict[tuple[str, str], Customer]:
     if not phones:
         return {}
+    return {(customer.phone, normalize_column(customer.name)): customer for customer in db.query(Customer).filter(Customer.phone.in_(phones)).order_by(Customer.id).all() if customer.phone}
 
-    customers: dict[tuple[str, str], Customer] = {}
 
-    for customer in (
-        db.query(Customer)
-        .filter(Customer.phone.in_(phones))
-        .order_by(Customer.id.asc())
-        .all()
-    ):
-        if customer.phone:
-            customers.setdefault(
-                (customer.phone, normalize_column(customer.name)),
-                customer,
-            )
+def _has_updates(customer: Customer, record: dict) -> bool:
+    return any(record.get(field) and getattr(customer, field) != record[field] for field in CUSTOMER_FIELDS)
 
-    return customers
 
-
-def refresh_fallback_customer(
-    customers_by_fallback: dict[tuple[str, str], Customer],
-    customer: Customer,
-    previous_key: tuple[str, str] | None = None,
-) -> None:
-    """Keep the in-memory fallback lookup consistent with current changes."""
-    if previous_key and customers_by_fallback.get(previous_key) is customer:
-        customers_by_fallback.pop(previous_key)
-
-    if customer.phone:
-        customers_by_fallback.setdefault(
-            (customer.phone, normalize_column(customer.name)),
-            customer,
-        )
-
-
-def find_duplicate_summary(
-    db: Session,
-    records: list[dict],
-) -> dict:
-    """
-    Calculate import statistics before importing.
-
-    Primary key:
-        consumer_number
-
-    Fallback:
-        phone + normalized name
-
-    Phone numbers alone are NOT treated as duplicates.
-    """
-
-    consumer_values = {
-        record["consumer_number"]
-        for record in records
-        if record.get("consumer_number")
-    }
-
-    customers_by_consumer = load_customers_by_consumer_number(
-        db,
-        consumer_values,
-    )
-
-    seen_consumers: set[str] = set()
-
-    duplicate_rows = 0
-    existing_rows = 0
-    update_rows = 0
-
-    # --------------------------------------------------------
-    # Records with consumer numbers
-    # --------------------------------------------------------
-
-    for record in records:
-
-        consumer = record.get(
-            "consumer_number"
-        )
-
-        if not consumer:
-            continue
-
-        if consumer in seen_consumers:
-            duplicate_rows += 1
-            continue
-
-        seen_consumers.add(consumer)
-
-        existing = customers_by_consumer.get(consumer)
-
-        if not existing:
-            continue
-
-        existing_rows += 1
-
-        if has_customer_updates(
-            existing,
-            record,
-        ):
-            update_rows += 1
-
-    # --------------------------------------------------------
-    # Records without consumer numbers
-    # --------------------------------------------------------
-
-    seen_fallback: set[
-        tuple[str, str]
-    ] = set()
-
-    for record in records:
-
-        if record.get("consumer_number"):
-            continue
-
-        phone = record.get("phone")
-
-        if not phone:
-            continue
-
-        name_key = normalize_column(
-            record.get("name", "")
-        )
-
-        fallback_key = (
-            phone,
-            name_key,
-        )
-
-        if fallback_key in seen_fallback:
-            duplicate_rows += 1
-            continue
-
-        seen_fallback.add(fallback_key)
-
-    return {
-        "duplicate_rows_in_file": duplicate_rows,
-        "already_in_database": existing_rows,
-        "update_rows": update_rows,
-        "new_records": max(
-            0,
-            len(records)
-            - duplicate_rows
-            - existing_rows,
-        ),
-    }
-
-
-# ============================================================
-# UPDATE HELPERS
-# ============================================================
-
-CUSTOMER_FIELDS = (
-    "name",
-    "phone",
-    "email",
-    "service",
-    "consumer_number",
-    "address",
-    "region",
-    "zone",
-    "circle",
-    "division",
-    "subdivision",
-    "business_unit",
-)
-
-
-def has_customer_updates(
-    customer: Customer,
-    record: dict,
-) -> bool:
-    """
-    Return True when the Excel record contains a useful value
-    that differs from the existing customer.
-
-    Empty Excel values are ignored and never erase CRM data.
-    """
-    for field in CUSTOMER_FIELDS:
-        incoming = record.get(field)
-
-        if not incoming:
-            continue
-
-        existing = getattr(customer, field, None)
-
-        if existing != incoming:
-            return True
-
-    return False
-
-
-def update_customer_fields(
-    customer: Customer,
-    record: dict,
-) -> int:
-    """
-    Synchronize useful Excel values into an existing customer.
-
-    Rules:
-    - Empty/None Excel values never overwrite CRM data.
-    - Non-empty Excel values update the field when different.
-    """
-    changed = 0
-
-    for field in CUSTOMER_FIELDS:
-        incoming = record.get(field)
-
-        if not incoming:
-            continue
-
-        existing = getattr(customer, field, None)
-
-        if existing == incoming:
-            continue
-
-        setattr(customer, field, incoming)
-        changed += 1
-
-    return changed
-
-
-
-# ============================================================
-# MULTI-SHEET MERGING
-# ============================================================
-
-def merge_records(records: list[dict]) -> list[dict]:
-    """
-    Merge records originating from multiple Excel sheets.
-
-    Primary match:
-        consumer_number
-
-    Fallback:
-        phone + normalized name
-
-    Existing non-empty values are preserved.
-    Missing fields are filled from duplicate records.
-    """
-
-    by_consumer: dict[str, dict] = {}
-    by_fallback: dict[tuple[str, str], dict] = {}
-
-    for record in records:
+def preview_records(db: Session, records: Iterable[dict], limit: int) -> tuple[dict, list[dict]]:
+    collected = list(records)
+    consumers = {record["consumer_number"] for record in collected if record.get("consumer_number")}
+    existing = _load_by_consumer(db, consumers)
+    seen: set[str] = set(); duplicates = existing_rows = updates = 0
+    for record in collected:
         consumer = record.get("consumer_number")
-
         if consumer:
-            key = str(consumer).strip()
-
-            if key not in by_consumer:
-                by_consumer[key] = dict(record)
-                continue
-
-            existing = by_consumer[key]
-
-            for field in CUSTOMER_FIELDS:
-                incoming = record.get(field)
-
-                if incoming and not existing.get(field):
-                    existing[field] = incoming
-
-            continue
-
-        phone = record.get("phone")
-        name_key = normalize_column(record.get("name", ""))
-
-        key = (phone or "", name_key)
-
-        if key not in by_fallback:
-            by_fallback[key] = dict(record)
-            continue
-
-        existing = by_fallback[key]
-
-        for field in CUSTOMER_FIELDS:
-            incoming = record.get(field)
-
-            if incoming and not existing.get(field):
-                existing[field] = incoming
-
-    return list(by_consumer.values()) + list(by_fallback.values())
+            if consumer in seen: duplicates += 1; continue
+            seen.add(consumer)
+            if consumer in existing:
+                existing_rows += 1; updates += int(_has_updates(existing[consumer], record))
+    return {"duplicate_rows_in_file": duplicates, "already_in_database": existing_rows, "update_rows": updates, "new_records": max(0, len(collected)-duplicates-existing_rows)}, collected[:limit]
 
 
-
-# ============================================================
-# IMPORT
-# ============================================================
-
-def import_records(
-    db: Session,
-    filename: str,
-    file_type: str,
-    records: list[dict],
-) -> dict:
-    """
-    Import customer records.
-
-    Behavior:
-
-    1. New consumer number
-       -> create customer.
-
-    2. Existing consumer number
-       -> do not create duplicate.
-       -> synchronize non-empty Excel fields.
-
-    3. No consumer number
-       -> use phone + normalized name
-          as fallback duplicate detection.
-
-    4. Empty Excel values never overwrite existing CRM data.
-       Non-empty changed Excel values are synchronized.
-    """
-
-    batch = ImportBatch(
-        filename=filename,
-        file_type=file_type,
-        total_rows=len(records),
-        status="processing",
-    )
-
-    db.add(batch)
-    db.flush()
-
+def preview_file(db: Session, path: Path, file_type: str, sheet_name: str | None, mapping: dict[str, Any], limit: int) -> tuple[dict, list[dict]]:
+    """Two bounded passes avoid keeping worksheet rows in memory for preview."""
+    consumers: set[str] = set()
+    fallback_phones: set[str] = set()
+    total = with_phone = duplicates = 0
     seen_consumers: set[str] = set()
-    seen_fallback: set[
-        tuple[str, str]
-    ] = set()
+    seen_fallback: set[tuple[str, str]] = set()
+    preview: list[dict] = []
+    for record in iter_records(path, file_type, sheet_name, mapping):
+        total += 1
+        if record.get("phone"):
+            with_phone += 1
+        if record.get("consumer_number"):
+            consumer = record["consumer_number"]
+            if consumer in seen_consumers:
+                duplicates += 1
+            seen_consumers.add(consumer); consumers.add(consumer)
+        elif record.get("phone"):
+            key = (record["phone"], normalize_column(record["name"]))
+            if key in seen_fallback:
+                duplicates += 1
+            seen_fallback.add(key); fallback_phones.add(record["phone"])
+        if len(preview) < limit:
+            preview.append(record)
+    by_consumer = _load_by_consumer(db, consumers)
+    by_fallback = _load_by_phone_name(db, fallback_phones)
+    existing_rows = updates = 0
+    counted_consumers: set[str] = set(); counted_fallback: set[tuple[str, str]] = set()
+    for record in iter_records(path, file_type, sheet_name, mapping):
+        consumer = record.get("consumer_number")
+        if consumer:
+            if consumer in counted_consumers: continue
+            counted_consumers.add(consumer); existing = by_consumer.get(consumer)
+        elif record.get("phone"):
+            key = (record["phone"], normalize_column(record["name"]))
+            if key in counted_fallback: continue
+            counted_fallback.add(key); existing = by_fallback.get(key)
+        else:
+            continue
+        if existing:
+            existing_rows += 1; updates += int(_has_updates(existing, record))
+    return {"rows_in_file": total, "valid_records": total, "records_with_phone": with_phone, "records_without_phone": total-with_phone, "duplicate_rows_in_file": duplicates, "already_in_database": existing_rows, "update_rows": updates, "new_records": max(0, total-duplicates-existing_rows)}, preview
 
-    imported = 0
-    updated = 0
-    duplicates = 0
-    skipped = 0
 
+def import_record_batches(db: Session, filename: str, file_type: str, records: Iterable[dict]) -> dict:
+    started = monotonic(); batch = ImportBatch(filename=filename, file_type=file_type, total_rows=0, status="processing"); db.add(batch); db.commit(); db.refresh(batch)
+    imported = updated = duplicates = skipped = total = 0; seen_consumers: set[str] = set(); seen_fallback: set[tuple[str, str]] = set()
     try:
-
-        consumer_numbers = {
-            record["consumer_number"]
-            for record in records
-            if record.get("consumer_number")
-        }
-        fallback_phones = {
-            record["phone"]
-            for record in records
-            if not record.get("consumer_number") and record.get("phone")
-        }
-        customers_by_consumer = load_customers_by_consumer_number(
-            db,
-            consumer_numbers,
-        )
-        customers_by_fallback = load_customers_by_phone_and_name(
-            db,
-            fallback_phones,
-        )
-
+        pending = []
         for record in records:
-
-            consumer = record.get(
-                "consumer_number"
-            )
-
-            # =================================================
-            # PRIMARY MATCH: CONSUMER NUMBER
-            # =================================================
-
-            if consumer:
-
-                # Duplicate inside current Excel file.
-                if consumer in seen_consumers:
-                    duplicates += 1
-                    continue
-
-                seen_consumers.add(consumer)
-
-                existing = customers_by_consumer.get(consumer)
-
-                # Existing customer.
-                if existing:
-
-                    previous_fallback_key = (
-                        (existing.phone, normalize_column(existing.name))
-                        if existing.phone
-                        else None
-                    )
-
-                    changed_fields = (
-                        update_customer_fields(
-                            existing,
-                            record,
-                        )
-                    )
-
-                    if changed_fields:
-                        updated += 1
-                    else:
-                        skipped += 1
-
-                    refresh_fallback_customer(
-                        customers_by_fallback,
-                        existing,
-                        previous_fallback_key,
-                    )
-
-                    continue
-
-            # =================================================
-            # FALLBACK MATCH: PHONE + NAME
-            # =================================================
-
-            else:
-
-                phone = record.get(
-                    "phone"
-                )
-
-                name_key = normalize_column(
-                    record.get("name", "")
-                )
-
-                fallback_key = (
-                    phone,
-                    name_key,
-                )
-
-                # Duplicate inside current file.
-                if (
-                    phone
-                    and fallback_key
-                    in seen_fallback
-                ):
-                    duplicates += 1
-                    continue
-
-                existing = (
-                    customers_by_fallback.get(fallback_key)
-                    if phone
-                    else None
-                )
-
-                if existing:
-
-                    previous_fallback_key = (
-                        (existing.phone, normalize_column(existing.name))
-                        if existing.phone
-                        else None
-                    )
-
-                    changed_fields = (
-                        update_customer_fields(
-                            existing,
-                            record,
-                        )
-                    )
-
-                    if changed_fields:
-                        updated += 1
-                    else:
-                        skipped += 1
-
-                    seen_fallback.add(
-                        fallback_key
-                    )
-                    refresh_fallback_customer(
-                        customers_by_fallback,
-                        existing,
-                        previous_fallback_key,
-                    )
-
-                    continue
-
-                if phone:
-                    seen_fallback.add(
-                        fallback_key
-                    )
-
-            # =================================================
-            # CREATE NEW CUSTOMER
-            # =================================================
-
-            customer_data = {
-                key: value
-                for key, value in record.items()
-                if key != "source_row"
-            }
-
-            customer = Customer(
-                **customer_data,
-                import_id=batch.id,
-                source_file=filename,
-                source_row=record["source_row"],
-            )
-
-            db.add(customer)
-            refresh_fallback_customer(
-                customers_by_fallback,
-                customer,
-            )
-
-            imported += 1
-
-        # -----------------------------------------------------
-        # Save import statistics
-        # -----------------------------------------------------
-
-        batch.imported_rows = imported
-        batch.duplicate_rows = duplicates
-        batch.skipped_rows = skipped
-        batch.status = "completed"
-
-        db.commit()
-
-        return {
-            "import_id": batch.id,
-            "total_rows": len(records),
-            "imported_rows": imported,
-            "updated_rows": updated,
-            "duplicate_rows": duplicates,
-            "skipped_rows": skipped,
-            "status": "completed",
-        }
-
+            pending.append(record)
+            if len(pending) >= IMPORT_BATCH_SIZE:
+                counts = _import_batch(db, batch, pending, seen_consumers, seen_fallback); total += len(pending); imported += counts[0]; updated += counts[1]; duplicates += counts[2]; skipped += counts[3]; pending = []
+        if pending:
+            counts = _import_batch(db, batch, pending, seen_consumers, seen_fallback); total += len(pending); imported += counts[0]; updated += counts[1]; duplicates += counts[2]; skipped += counts[3]
+        batch.total_rows, batch.imported_rows, batch.duplicate_rows, batch.skipped_rows, batch.status = total, imported, duplicates, skipped, "completed"; db.commit()
     except Exception:
-        db.rollback()
+        db.rollback(); batch.status = "failed"; db.add(batch); db.commit(); raise
+    return {"import_id": batch.id, "total_rows": total, "imported_rows": imported, "updated_rows": updated, "duplicate_rows": duplicates, "skipped_rows": skipped, "status": "completed", "processing_seconds": round(monotonic()-started, 3)}
 
-        batch.status = "failed"
 
-        try:
-            db.commit()
-        except Exception:
-            db.rollback()
-
-        raise
+def _import_batch(db: Session, batch: ImportBatch, records: list[dict], seen_consumers: set[str], seen_fallback: set[tuple[str, str]]) -> tuple[int, int, int, int]:
+    consumers = {record["consumer_number"] for record in records if record.get("consumer_number")}; phones = {record["phone"] for record in records if not record.get("consumer_number") and record.get("phone")}
+    by_consumer = _load_by_consumer(db, consumers); by_fallback = _load_by_phone_name(db, phones); imported = updated = duplicates = skipped = 0
+    try:
+        for record in records:
+            consumer = record.get("consumer_number"); key = (record.get("phone") or "", normalize_column(record["name"]))
+            if consumer and consumer in seen_consumers: duplicates += 1; continue
+            if not consumer and record.get("phone") and key in seen_fallback: duplicates += 1; continue
+            existing = by_consumer.get(consumer) if consumer else by_fallback.get(key) if record.get("phone") else None
+            if consumer: seen_consumers.add(consumer)
+            elif record.get("phone"): seen_fallback.add(key)
+            if existing:
+                changed = 0
+                for field in CUSTOMER_FIELDS:
+                    if record.get(field) and getattr(existing, field) != record[field]: setattr(existing, field, record[field]); changed += 1
+                updated += int(bool(changed)); skipped += int(not changed); continue
+            customer = Customer(**{field: record.get(field) for field in CUSTOMER_FIELDS}, import_id=batch.id, source_file=batch.filename, source_row=record["source_row"]); db.add(customer); imported += 1
+        db.commit()
+    except Exception:
+        db.rollback(); raise
+    return imported, updated, duplicates, skipped
