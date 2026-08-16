@@ -1,901 +1,349 @@
 from __future__ import annotations
 
-"""
-CRM Excel / CSV Import Router
-
-This module handles:
-
-    POST /api/import/analyze
-    POST /api/import/preview
-    POST /api/import/import
-
-Design goals:
-    - Keep uploads memory-safe.
-    - Never load the complete XLSX into RAM.
-    - Enforce a maximum upload size.
-    - Validate worksheet selection.
-    - Clean up temporary files.
-    - Return useful API errors.
-    - Work correctly with the existing import_service.py.
-    - Avoid unnecessary duplicate file analysis.
-"""
-
-import logging
-import tempfile
+import csv
+import os
+import re
+from itertools import islice
 from pathlib import Path
 from time import monotonic
+from typing import Any, Iterable, Iterator
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from openpyxl import load_workbook
+from sqlalchemy import insert, update
 from sqlalchemy.orm import Session
 
-from ..database import get_db
-from ..services.import_service import (
-    MAX_SAMPLE_ROWS,
-    analyze_file,
-    import_record_batches,
-    iter_records,
-    preview_file,
-    workbook_sheets,
+from ..models import Customer, ImportBatch
+
+MAX_WORKSHEET_ROWS = 50_000
+MAX_COLUMNS = 80
+MAX_HEADER_SCAN_ROWS = 30
+MAX_SAMPLE_ROWS = 100
+IMPORT_BATCH_SIZE = max(100, min(1_000, int(os.getenv("IMPORT_BATCH_SIZE", "500"))))
+
+FIELD_ALIASES = {
+    "name": ("name", "customer name", "consumer name", "client name", "full name"),
+    "phone": ("phone", "mobile", "mobile number", "contact", "contact no", "contact number", "phone number", "telephone"),
+    "email": ("email", "email address", "e mail"),
+    "consumer_number": ("consumer number", "consumer no", "consumer id", "account number", "account no"),
+    "service": ("service", "product", "service name", "requirement", "trf desc"),
+    "region": ("region", "region name"),
+    "zone": ("zone", "zone name"),
+    "circle": ("circle", "circle name"),
+    "division": ("division", "division name"),
+    "subdivision": ("subdivision", "sub division", "subdivision name"),
+    "business_unit": ("bu", "business unit"),
+}
+CUSTOMER_FIELDS = (
+    "name", "phone", "email", "service", "consumer_number", "address", "region",
+    "zone", "circle", "division", "subdivision", "business_unit",
 )
 
 
-# ============================================================
-# ROUTER CONFIGURATION
-# ============================================================
-
-router = APIRouter(
-    prefix="/api/import",
-    tags=["Import"],
-)
-
-logger = logging.getLogger(__name__)
+def normalize_column(value: Any) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(value).strip().lower())).strip()
 
 
-# ============================================================
-# UPLOAD SAFETY CONFIGURATION
-# ============================================================
-
-# Maximum uploaded file size.
-#
-# 12 MB is intentionally conservative because your Render
-# instance has limited memory.
-MAX_UPLOAD_BYTES = 12 * 1024 * 1024
-
-# Uploads are read in 1 MB chunks.
-UPLOAD_CHUNK_SIZE = 1024 * 1024
-
-
-# ============================================================
-# FILE TYPE DETECTION
-# ============================================================
-
-def _file_type(filename: str) -> str:
-    """
-    Determine the supported file type from the filename.
-
-    Supported:
-        .xlsx
-        .csv
-
-    Deliberately not supporting:
-        .xls
-
-    The current importer uses openpyxl's streaming XLSX reader,
-    which is designed for .xlsx files.
-    """
-
-    suffix = Path(filename).suffix.lower()
-
-    if suffix == ".xlsx":
-        return "xlsx"
-
-    if suffix == ".csv":
-        return "csv"
-
-    raise HTTPException(
-        status_code=400,
-        detail="Only CSV and XLSX files are supported.",
-    )
+def clean_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "nat", "<na>"}:
+        return None
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    if re.fullmatch(r"0{8,}", re.sub(r"\s+", "", text)):
+        return None
+    return text
 
 
-# ============================================================
-# SAVE UPLOADED FILE SAFELY
-# ============================================================
+def normalize_phone(value: str | None) -> str | None:
+    if not value:
+        return None
+    digits = re.sub(r"\D", "", value)
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 and digits[0] in "6789" else None
 
-async def _save_upload(
-    file: UploadFile,
-    filename: str,
-) -> tuple[Path, int]:
-    """
-    Save the uploaded file to a temporary file.
 
-    IMPORTANT:
-    We do not call await file.read() without a limit.
+def _bounded_rows(rows: Iterable[tuple[Any, ...]]) -> Iterator[tuple[int, tuple[Any, ...]]]:
+    for number, row in enumerate(rows, start=1):
+        if number > MAX_WORKSHEET_ROWS:
+            raise ValueError(f"Worksheet exceeds the {MAX_WORKSHEET_ROWS:,}-row safety limit.")
+        yield number, tuple(row[:MAX_COLUMNS])
 
-    Instead, the upload is copied in chunks so a large request
-    cannot consume the entire Render instance's RAM.
-    """
 
-    suffix = Path(filename).suffix.lower()
-
-    temporary = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=suffix,
-        prefix="crm-import-",
-    )
-
-    path = Path(temporary.name)
-    size = 0
-
+def workbook_sheets(path: Path) -> list[str]:
+    workbook = None
     try:
-        while True:
-            chunk = await file.read(UPLOAD_CHUNK_SIZE)
+        workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+        return list(workbook.sheetnames)
+    except Exception as exc:
+        raise ValueError("Could not read XLSX workbook.") from exc
+    finally:
+        if workbook is not None:
+            workbook.close()
 
-            if not chunk:
-                break
 
-            size += len(chunk)
-
-            # Stop immediately if the file is too large.
-            if size > MAX_UPLOAD_BYTES:
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"Upload exceeds the "
-                        f"{MAX_UPLOAD_BYTES // 1024 // 1024} MB "
-                        f"safety limit."
-                    ),
-                )
-
-            temporary.write(chunk)
-
-        temporary.close()
-
-        if size == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded file is empty.",
-            )
-
-        return path, size
-
-    except Exception:
-        # Always close the file handle.
-        try:
-            temporary.close()
-        except Exception:
-            pass
-
-        # Remove partially uploaded file.
-        path.unlink(missing_ok=True)
-
+def _sheet_rows(path: Path, sheet_name: str) -> Iterator[tuple[int, tuple[Any, ...]]]:
+    workbook = None
+    try:
+        workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+        if sheet_name not in workbook.sheetnames:
+            raise ValueError("Selected sheet does not exist.")
+        yield from _bounded_rows(workbook[sheet_name].iter_rows(values_only=True))
+    except ValueError:
         raise
+    except Exception as exc:
+        raise ValueError("Could not parse XLSX worksheet.") from exc
+    finally:
+        if workbook is not None:
+            workbook.close()
 
 
-# ============================================================
-# WORKSHEET SELECTION
-# ============================================================
+def _csv_rows(path: Path) -> Iterator[tuple[int, tuple[Any, ...]]]:
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            yield from _bounded_rows(csv.reader(handle))
+    except UnicodeDecodeError as exc:
+        raise ValueError("CSV must be UTF-8 encoded.") from exc
+    except csv.Error as exc:
+        raise ValueError("Could not parse CSV file.") from exc
 
-def _get_sheets(
-    path: Path,
-    file_type: str,
-    selected_sheet: str | None,
-) -> list[str | None]:
-    """
-    Get available worksheets.
 
-    CSV:
-        Returns [None]
+def _header_score(row: tuple[Any, ...]) -> int:
+    text = " | ".join(normalize_column(value) for value in row if clean_value(value))
+    keywords = ("consumer number", "consumer name", "customer name", "contact", "phone", "mobile", "email", "address")
+    return sum(2 for item in keywords if item in text) + (5 if "consumer number" in text else 0) + (5 if "consumer name" in text else 0)
 
-    XLSX:
-        Returns all worksheet names.
 
-    If the caller specified a worksheet, validate it.
-    """
-
-    if file_type == "csv":
-        sheets: list[str | None] = [None]
-
-    else:
-        try:
+def _scan_source(path: Path, file_type: str, sheet_name: str | None) -> tuple[list[tuple[int, tuple[Any, ...]]], str | None]:
+    if file_type == "xlsx":
+        if sheet_name is None:
             sheets = workbook_sheets(path)
-
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=str(exc),
-            ) from exc
-
-    # Validate explicitly selected worksheet.
-    if selected_sheet is not None:
-
-        if selected_sheet not in sheets:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": "Selected sheet does not exist.",
-                    "available_sheets": [
-                        sheet
-                        for sheet in sheets
-                        if sheet is not None
-                    ],
-                },
-            )
-
-        return [selected_sheet]
-
-    return sheets
+            sheet_name = sheets[0] if sheets else None
+        if not sheet_name:
+            raise ValueError("Workbook contains no worksheets.")
+        source = _sheet_rows(path, sheet_name)
+    else:
+        source = _csv_rows(path)
+    return list(islice(source, MAX_HEADER_SCAN_ROWS + MAX_SAMPLE_ROWS)), sheet_name
 
 
-# ============================================================
-# FILE ANALYSIS HELPER
-# ============================================================
-
-def _run_analysis(
-    path: Path,
-    file_type: str,
-    sheet: str | None,
-) -> dict:
-    """
-    Run import-service analysis and convert known parsing
-    errors into clean HTTP errors.
-    """
-
-    try:
-        return analyze_file(
-            path,
-            file_type,
-            sheet,
-        )
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
-
-    except HTTPException:
-        raise
-
-    except Exception:
-        logger.exception(
-            "Unexpected error while analyzing file. "
-            "file_type=%s sheet=%s",
-            file_type,
-            sheet,
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail="Could not analyze the uploaded file.",
-        )
+def _headers_and_mapping(scanned: list[tuple[int, tuple[Any, ...]]]) -> tuple[int, list[str], dict[str, Any]]:
+    if not scanned:
+        raise ValueError("The selected sheet is empty.")
+    header_number, header_values = max(scanned[:MAX_HEADER_SCAN_ROWS], key=lambda item: _header_score(item[1]))
+    if not any(clean_value(value) for value in header_values):
+        raise ValueError("The selected sheet is empty.")
+    headers = [clean_value(value) or f"Unnamed: {index}" for index, value in enumerate(header_values)]
+    normalized = {header: normalize_column(header) for header in headers}
+    mapping: dict[str, Any] = {}
+    for field, aliases in FIELD_ALIASES.items():
+        aliases_normalized = {normalize_column(alias) for alias in aliases}
+        for header, value in normalized.items():
+            if value in aliases_normalized:
+                mapping[field] = header
+                break
+    for field, source in {
+        "name": "consumer_name", "consumer_number": "consumer_number", "email": "email_id",
+        "service": "trf_desc", "region": "region_name", "zone": "zone_name",
+        "circle": "circle_name", "division": "division_name", "subdivision": "subdivision_name",
+        "business_unit": "bu",
+    }.items():
+        for header, value in normalized.items():
+            if value == normalize_column(source):
+                mapping[field] = header
+                break
+    address_columns = [header for header, value in normalized.items() if value in {"address", "address 1", "address 2", "address 3", "address l1", "address l2", "address l3"}]
+    if address_columns:
+        mapping["address_columns"] = address_columns
+    return header_number, headers, mapping
 
 
-# ============================================================
-# VALIDATE ANALYSIS
-# ============================================================
-
-def _validate_analysis(analysis: dict) -> None:
-    """
-    Validate whether the importer detected the minimum
-    required customer information.
-
-    Currently the importer requires a customer name.
-    """
-
-    if analysis.get("missing_required"):
-
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": (
-                    "Could not detect a customer name column."
-                ),
-                "analysis": analysis,
-            },
-        )
+def analyze_file(path: Path, file_type: str, sheet_name: str | None = None) -> dict:
+    scanned, selected_sheet = _scan_source(path, file_type, sheet_name)
+    header_row, headers, mapping = _headers_and_mapping(scanned)
+    sample_rows = max(0, len(scanned) - next(index for index, item in enumerate(scanned) if item[0] == header_row) - 1)
+    return {
+        "total_rows": sample_rows,
+        "columns": headers,
+        "header_row": header_row,
+        "detected_mapping": mapping,
+        "missing_required": [] if "name" in mapping else ["name"],
+        "selected_sheet": selected_sheet,
+        "sample_rows": sample_rows,
+    }
 
 
-# ============================================================
-# ANALYZE ENDPOINT
-# ============================================================
+def iter_records(path: Path, file_type: str, sheet_name: str | None, mapping: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    source: Iterable[tuple[int, tuple[Any, ...]]]
+    if file_type == "xlsx":
+        if not sheet_name:
+            raise ValueError("A worksheet must be selected.")
+        source = _sheet_rows(path, sheet_name)
+    else:
+        source = _csv_rows(path)
+    rows = iter(source)
+    initial = list(islice(rows, MAX_HEADER_SCAN_ROWS))
+    if not initial:
+        return
+    header_number, headers, _ = _headers_and_mapping(initial)
+    start_index = next(index for index, item in enumerate(initial) if item[0] == header_number) + 1
+    for number, values in (*initial[start_index:], *()):
+        yield from _record_from_values(number, values, headers, mapping)
+    for number, values in rows:
+        yield from _record_from_values(number, values, headers, mapping)
 
-@router.post("/analyze")
-async def analyze(
-    file: UploadFile = File(...),
-    sheet: str | None = Query(default=None),
-):
-    """
-    Analyze an uploaded CSV/XLSX file.
 
-    For XLSX:
-        - If no sheet is selected, analyze all worksheet names
-          and select the first usable worksheet.
-        - If a sheet is selected, analyze only that sheet.
+def _record_from_values(number: int, values: tuple[Any, ...], headers: list[str], mapping: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    row = {headers[index]: values[index] if index < len(values) else None for index in range(len(headers))}
+    name = clean_value(row.get(mapping.get("name", "")))
+    phone = clean_value(row.get(mapping.get("phone", "")))
+    if not name and not phone:
+        return
+    address = ", ".join(dict.fromkeys(value for column in mapping.get("address_columns", []) if (value := clean_value(row.get(column))))) or None
+    yield {
+        "name": name or "Unknown", "phone": normalize_phone(phone),
+        "email": clean_value(row.get(mapping.get("email", ""))),
+        "service": clean_value(row.get(mapping.get("service", ""))),
+        "consumer_number": clean_value(row.get(mapping.get("consumer_number", ""))),
+        "address": address, "region": clean_value(row.get(mapping.get("region", ""))),
+        "zone": clean_value(row.get(mapping.get("zone", ""))), "circle": clean_value(row.get(mapping.get("circle", ""))),
+        "division": clean_value(row.get(mapping.get("division", ""))),
+        "subdivision": clean_value(row.get(mapping.get("subdivision", ""))),
+        "business_unit": clean_value(row.get(mapping.get("business_unit", ""))), "source_row": number,
+    }
 
-    IMPORTANT:
-        This endpoint does NOT import customers.
-    """
 
-    filename = file.filename or "upload"
+def _load_by_consumer(db: Session, values: set[str]) -> dict[str, Customer]:
+    if not values:
+        return {}
+    return {customer.consumer_number: customer for customer in db.query(Customer).filter(Customer.consumer_number.in_(values)).all() if customer.consumer_number}
 
-    # Determine extension.
-    file_type = _file_type(filename)
 
-    # Save upload to temporary disk.
-    path, size = await _save_upload(
-        file,
-        filename,
-    )
+def _load_by_phone_name(db: Session, phones: set[str]) -> dict[tuple[str, str], Customer]:
+    if not phones:
+        return {}
+    return {(customer.phone, normalize_column(customer.name)): customer for customer in db.query(Customer).filter(Customer.phone.in_(phones)).all() if customer.phone}
 
-    started = monotonic()
 
-    try:
-        # --------------------------------------------------------
-        # Get available sheets
-        # --------------------------------------------------------
+def _has_updates(customer: Customer, record: dict[str, Any]) -> bool:
+    return any(record.get(field) and getattr(customer, field) != record[field] for field in CUSTOMER_FIELDS)
 
-        sheets = _get_sheets(
-            path,
-            file_type,
-            sheet,
-        )
 
-        # --------------------------------------------------------
-        # CSV
-        # --------------------------------------------------------
-
-        if file_type == "csv":
-
-            analysis = _run_analysis(
-                path,
-                file_type,
-                None,
-            )
-
-            analysis.update(
-                {
-                    "file": filename,
-                    "file_type": file_type,
-                    "sheets": None,
-                    "selected_sheet": None,
-                    "mode": "csv",
-                }
-            )
-
-            return analysis
-
-        # --------------------------------------------------------
-        # XLSX WITH EXPLICIT SHEET
-        # --------------------------------------------------------
-
-        if sheet is not None:
-
-            analysis = _run_analysis(
-                path,
-                file_type,
-                sheet,
-            )
-
-            analysis.update(
-                {
-                    "file": filename,
-                    "file_type": file_type,
-                    "sheets": sheets,
-                    "selected_sheet": sheet,
-                    "mode": "single_sheet",
-                }
-            )
-
-            return analysis
-
-        # --------------------------------------------------------
-        # XLSX WITHOUT EXPLICIT SHEET
-        #
-        # Analyze each worksheet only once.
-        # --------------------------------------------------------
-
-        sheet_results = []
-
-        for current_sheet in sheets:
-
-            if current_sheet is None:
+def preview_file(db: Session, path: Path, file_type: str, sheet_name: str | None, mapping: dict[str, Any], limit: int) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    """Preview only the requested bounded sample; never scan the full workbook."""
+    preview = list(islice(iter_records(path, file_type, sheet_name, mapping), limit))
+    consumers = {record["consumer_number"] for record in preview if record.get("consumer_number")}
+    phones = {record["phone"] for record in preview if not record.get("consumer_number") and record.get("phone")}
+    by_consumer = _load_by_consumer(db, consumers)
+    by_phone_name = _load_by_phone_name(db, phones)
+    seen_consumers: set[str] = set()
+    seen_fallback: set[tuple[str, str]] = set()
+    duplicates = existing_rows = updates = with_phone = 0
+    for record in preview:
+        consumer = record.get("consumer_number")
+        key = (record.get("phone") or "", normalize_column(record["name"]))
+        if record.get("phone"):
+            with_phone += 1
+        if consumer:
+            if consumer in seen_consumers:
+                duplicates += 1
                 continue
-
-            try:
-                analysis = _run_analysis(
-                    path,
-                    file_type,
-                    current_sheet,
-                )
-
-                sheet_results.append(
-                    {
-                        "sheet": current_sheet,
-                        "rows": analysis.get(
-                            "total_rows",
-                            0,
-                        ),
-                        "valid_records": 0,
-                        "header_row": analysis.get(
-                            "header_row"
-                        ),
-                        "detected_mapping": analysis.get(
-                            "detected_mapping",
-                            {},
-                        ),
-                        "status": (
-                            "skipped"
-                            if analysis.get(
-                                "missing_required"
-                            )
-                            else "processed"
-                        ),
-                    }
-                )
-
-            except HTTPException as exc:
-
-                # Don't make one broken worksheet prevent
-                # the user from selecting another worksheet.
-                sheet_results.append(
-                    {
-                        "sheet": current_sheet,
-                        "rows": 0,
-                        "valid_records": 0,
-                        "header_row": None,
-                        "detected_mapping": {},
-                        "status": "error",
-                        "error": exc.detail,
-                    }
-                )
-
-        # --------------------------------------------------------
-        # Find first usable worksheet.
-        # --------------------------------------------------------
-
-        selected_sheet = next(
-            (
-                item["sheet"]
-                for item in sheet_results
-                if item["status"] == "processed"
-            ),
-            None,
-        )
-
-        # --------------------------------------------------------
-        # No usable worksheet.
-        # --------------------------------------------------------
-
-        if not selected_sheet:
-
-            return {
-                "file": filename,
-                "file_type": file_type,
-                "sheets": [
-                    sheet_name
-                    for sheet_name in sheets
-                    if sheet_name
-                ],
-                "selected_sheet": None,
-                "mode": "select_sheet",
-                "sheet_results": sheet_results,
-                "total_records": 0,
-                "records_with_phone": 0,
-                "records_without_phone": 0,
-                "missing_required": ["name"],
-            }
-
-        # --------------------------------------------------------
-        # Return the analysis of the selected worksheet.
-        #
-        # This is one additional analysis only for the selected
-        # worksheet so the frontend receives the complete mapping.
-        # --------------------------------------------------------
-
-        selected_analysis = _run_analysis(
-            path,
-            file_type,
-            selected_sheet,
-        )
-
-        selected_analysis.update(
-            {
-                "file": filename,
-                "file_type": file_type,
-                "sheets": [
-                    sheet_name
-                    for sheet_name in sheets
-                    if sheet_name
-                ],
-                "selected_sheet": selected_sheet,
-                "mode": "single_sheet",
-                "sheet_results": sheet_results,
-            }
-        )
-
-        return selected_analysis
-
-    except HTTPException:
-        raise
-
-    except Exception:
-        logger.exception(
-            "Unexpected import analyze failure. "
-            "filename=%s size=%d sheet=%s",
-            filename,
-            size,
-            sheet or "all",
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail="Could not analyze the uploaded file.",
-        )
-
-    finally:
-        # --------------------------------------------------------
-        # ALWAYS DELETE TEMPORARY FILE
-        # --------------------------------------------------------
-
-        path.unlink(missing_ok=True)
-
-        logger.info(
-            "Import analyze finished: "
-            "filename=%s size=%d sheet=%s seconds=%.3f",
-            filename,
-            size,
-            sheet or "all",
-            monotonic() - started,
-        )
+            seen_consumers.add(consumer)
+            existing = by_consumer.get(consumer)
+        elif record.get("phone"):
+            if key in seen_fallback:
+                duplicates += 1
+                continue
+            seen_fallback.add(key)
+            existing = by_phone_name.get(key)
+        else:
+            existing = None
+        if existing:
+            existing_rows += 1
+            updates += int(_has_updates(existing, record))
+    total = len(preview)
+    return {
+        "rows_in_file": total, "valid_records": total, "records_with_phone": with_phone,
+        "records_without_phone": total - with_phone, "duplicate_rows_in_file": duplicates,
+        "already_in_database": existing_rows, "update_rows": updates,
+        "new_records": max(0, total - duplicates - existing_rows), "sampled_rows": total,
+    }, preview
 
 
-# ============================================================
-# PREVIEW ENDPOINT
-# ============================================================
-
-@router.post("/preview")
-async def preview(
-    file: UploadFile = File(...),
-    sheet: str | None = Query(default=None),
-    limit: int = Query(
-        default=100,
-        ge=1,
-        le=MAX_SAMPLE_ROWS,
-    ),
-    db: Session = Depends(get_db),
-):
-    """
-    Preview customer records before importing.
-
-    The preview does not modify the database.
-    """
-
-    filename = file.filename or "upload"
-    file_type = _file_type(filename)
-
-    path, size = await _save_upload(
-        file,
-        filename,
-    )
-
+def import_record_batches(db: Session, filename: str, file_type: str, records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     started = monotonic()
-
+    batch = ImportBatch(filename=filename, file_type=file_type, total_rows=0, status="processing")
+    db.add(batch)
+    db.commit()
+    batch_id = batch.id
+    imported = updated = duplicates = skipped = total = 0
     try:
-        # --------------------------------------------------------
-        # Determine worksheet.
-        # --------------------------------------------------------
-
-        selected = _get_sheets(
-            path,
-            file_type,
-            sheet,
-        )
-
-        # XLSX preview requires exactly one worksheet.
-        if file_type == "xlsx" and len(selected) != 1:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Choose a worksheet before previewing "
-                    "an XLSX file."
-                ),
-            )
-
-        selected_sheet = selected[0]
-
-        # --------------------------------------------------------
-        # Analyze selected source.
-        # --------------------------------------------------------
-
-        analysis = _run_analysis(
-            path,
-            file_type,
-            selected_sheet,
-        )
-
-        _validate_analysis(analysis)
-
-        # --------------------------------------------------------
-        # Generate preview.
-        # --------------------------------------------------------
-
-        summary, rows = preview_file(
-            db,
-            path,
-            file_type,
-            selected_sheet,
-            analysis["detected_mapping"],
-            limit,
-        )
-
-        return {
-            "file": filename,
-            "file_type": file_type,
-            "sheet": selected_sheet,
-            "sheets": (
-                [
-                    sheet_name
-                    for sheet_name in selected
-                    if sheet_name
-                ]
-                if file_type == "xlsx"
-                else None
-            ),
-            "mode": (
-                "single_sheet"
-                if file_type == "xlsx"
-                else "csv"
-            ),
-            "analysis": analysis,
-            "summary": summary,
-            "preview": rows,
-        }
-
-    except HTTPException:
-        raise
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
-
+        pending: list[dict[str, Any]] = []
+        for record in records:
+            pending.append(record)
+            if len(pending) >= IMPORT_BATCH_SIZE:
+                counts = _import_batch(db, batch_id, filename, pending)
+                total += len(pending); imported += counts[0]; updated += counts[1]; duplicates += counts[2]; skipped += counts[3]
+                pending.clear()
+        if pending:
+            counts = _import_batch(db, batch_id, filename, pending)
+            total += len(pending); imported += counts[0]; updated += counts[1]; duplicates += counts[2]; skipped += counts[3]
+        db.execute(update(ImportBatch).where(ImportBatch.id == batch_id).values(total_rows=total, imported_rows=imported, duplicate_rows=duplicates, skipped_rows=skipped, status="completed"))
+        db.commit()
     except Exception:
-        logger.exception(
-            "Unexpected import preview failure. "
-            "filename=%s size=%d sheet=%s",
-            filename,
-            size,
-            sheet or "default",
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail="Could not generate import preview.",
-        )
-
-    finally:
-        # Always remove uploaded temporary file.
-        path.unlink(missing_ok=True)
-
-        logger.info(
-            "Import preview finished: "
-            "filename=%s size=%d sheet=%s seconds=%.3f",
-            filename,
-            size,
-            sheet or "default",
-            monotonic() - started,
-        )
+        db.rollback()
+        db.execute(update(ImportBatch).where(ImportBatch.id == batch_id).values(status="failed"))
+        db.commit()
+        raise
+    return {"import_id": batch_id, "total_rows": total, "imported_rows": imported, "updated_rows": updated, "duplicate_rows": duplicates, "skipped_rows": skipped, "status": "completed", "processing_seconds": round(monotonic() - started, 3)}
 
 
-# ============================================================
-# IMPORT ENDPOINT
-# ============================================================
-
-@router.post("/import")
-async def import_file(
-    file: UploadFile = File(...),
-    sheet: str | None = Query(default=None),
-    db: Session = Depends(get_db),
-):
-    """
-    Import customers from CSV/XLSX into PostgreSQL.
-
-    XLSX:
-        A worksheet must be explicitly selected.
-
-    CSV:
-        No worksheet is required.
-    """
-
-    filename = file.filename or "upload"
-    file_type = _file_type(filename)
-
-    path, size = await _save_upload(
-        file,
-        filename,
-    )
-
-    started = monotonic()
-
+def _import_batch(db: Session, batch_id: int, filename: str, records: list[dict[str, Any]]) -> tuple[int, int, int, int]:
+    consumers = {record["consumer_number"] for record in records if record.get("consumer_number")}
+    phones = {record["phone"] for record in records if not record.get("consumer_number") and record.get("phone")}
+    by_consumer = _load_by_consumer(db, consumers)
+    by_phone_name = _load_by_phone_name(db, phones)
+    seen_consumers: set[str] = set()
+    seen_fallback: set[tuple[str, str]] = set()
+    inserts: list[dict[str, Any]] = []
+    imported = updated = duplicates = skipped = 0
     try:
-        # --------------------------------------------------------
-        # XLSX requires a selected worksheet.
-        # --------------------------------------------------------
-
-        if file_type == "xlsx" and not sheet:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Choose a worksheet before "
-                    "importing an XLSX file."
-                ),
-            )
-
-        # --------------------------------------------------------
-        # Get selected worksheet.
-        # --------------------------------------------------------
-
-        selected = _get_sheets(
-            path,
-            file_type,
-            sheet,
-        )
-
-        # Safety check.
-        if file_type == "xlsx" and len(selected) != 1:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Choose exactly one worksheet "
-                    "before importing."
-                ),
-            )
-
-        # --------------------------------------------------------
-        # Analyze worksheet.
-        # --------------------------------------------------------
-
-        analyses = []
-
-        for current_sheet in selected:
-
-            analysis = _run_analysis(
-                path,
-                file_type,
-                current_sheet,
-            )
-
-            _validate_analysis(analysis)
-
-            analyses.append(
-                (
-                    current_sheet,
-                    analysis,
-                )
-            )
-
-        # --------------------------------------------------------
-        # Build a lazy record generator.
-        #
-        # IMPORTANT:
-        # Do NOT convert this to list().
-        #
-        # iter_records() streams the worksheet.
-        # --------------------------------------------------------
-
-        def records_generator():
-
-            for current_sheet, analysis in analyses:
-
-                yield from iter_records(
-                    path,
-                    file_type,
-                    current_sheet,
-                    analysis["detected_mapping"],
-                )
-
-        # --------------------------------------------------------
-        # Import in database batches.
-        # --------------------------------------------------------
-
-        result = import_record_batches(
-            db,
-            filename,
-            file_type,
-            records_generator(),
-        )
-
-        # --------------------------------------------------------
-        # No records found.
-        # --------------------------------------------------------
-
-        if not result.get("total_rows"):
-            raise HTTPException(
-                status_code=422,
-                detail="No valid customer records found.",
-            )
-
-        # --------------------------------------------------------
-        # Add frontend-friendly metadata.
-        # --------------------------------------------------------
-
-        result.update(
-            {
-                "file": filename,
-                "file_type": file_type,
-                "mode": (
-                    "single_sheet"
-                    if file_type == "xlsx"
-                    else "csv"
-                ),
-                "sheet": sheet,
-                "sheets": [
-                    current
-                    for current in selected
-                    if current
-                ],
-                "sheets_processed": len(selected),
-            }
-        )
-
-        logger.info(
-            "Import completed: "
-            "filename=%s size=%d sheet=%s "
-            "rows=%d imported=%d updated=%d "
-            "duplicates=%d skipped=%d seconds=%.3f",
-            filename,
-            size,
-            sheet or "default",
-            result.get("total_rows", 0),
-            result.get("imported_rows", 0),
-            result.get("updated_rows", 0),
-            result.get("duplicate_rows", 0),
-            result.get("skipped_rows", 0),
-            monotonic() - started,
-        )
-
-        return result
-
-    except HTTPException:
-        raise
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
-
+        for record in records:
+            consumer = record.get("consumer_number")
+            key = (record.get("phone") or "", normalize_column(record["name"]))
+            if consumer and consumer in seen_consumers:
+                duplicates += 1
+                continue
+            if not consumer and record.get("phone") and key in seen_fallback:
+                duplicates += 1
+                continue
+            if consumer:
+                seen_consumers.add(consumer)
+                existing = by_consumer.get(consumer)
+            elif record.get("phone"):
+                seen_fallback.add(key)
+                existing = by_phone_name.get(key)
+            else:
+                existing = None
+            if existing:
+                changed = False
+                for field in CUSTOMER_FIELDS:
+                    if record.get(field) and getattr(existing, field) != record[field]:
+                        setattr(existing, field, record[field])
+                        changed = True
+                updated += int(changed)
+                skipped += int(not changed)
+                continue
+            inserts.append({**{field: record.get(field) for field in CUSTOMER_FIELDS}, "import_id": batch_id, "source_file": filename, "source_row": record["source_row"]})
+        if inserts:
+            db.execute(insert(Customer), inserts)
+            imported = len(inserts)
+        db.commit()
     except Exception:
-        logger.exception(
-            "Unexpected import failure: "
-            "filename=%s size=%d sheet=%s",
-            filename,
-            size,
-            sheet or "default",
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Import could not be completed. "
-                "Please check the file format and try again."
-            ),
-        )
-
-    finally:
-        # --------------------------------------------------------
-        # ALWAYS DELETE TEMPORARY FILE
-        # --------------------------------------------------------
-
-        path.unlink(missing_ok=True)
-
-        logger.info(
-            "Import request finished: "
-            "filename=%s size=%d sheet=%s seconds=%.3f",
-            filename,
-            size,
-            sheet or "default",
-            monotonic() - started,
-        )
+        db.rollback()
+        raise
+    return imported, updated, duplicates, skipped
