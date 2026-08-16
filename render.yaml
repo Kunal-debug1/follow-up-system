@@ -1,10 +1,16 @@
 services:
+  # ---------------------------------------------------------------------------
+  # Backend — FastAPI web service
+  # ---------------------------------------------------------------------------
   - type: web
     name: crm-follow-up-api
     runtime: python
     rootDir: backend
     buildCommand: pip install -r requirements.txt
-    startCommand: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers
+    # preDeployCommand runs BEFORE the new instance starts receiving traffic.
+    # If alembic fails, the deploy is aborted — uvicorn will not start.
+    preDeployCommand: alembic upgrade head
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
@@ -14,10 +20,21 @@ services:
       - key: CRM_ADMIN_PASSWORD
         sync: false
       - key: CRM_AUTH_SECRET
+        # Render auto-generates a secure random value if not set manually
         generateValue: true
       - key: CORS_ORIGINS
         sync: false
+      # Optional — override defaults if needed:
+      # - key: IMPORT_BATCH_SIZE
+      #   value: "500"
+      # - key: MAX_UPLOAD_BYTES
+      #   value: "25165824"    # 24 MB
+      # - key: MAX_WORKSHEET_ROWS
+      #   value: "100000"
 
+  # ---------------------------------------------------------------------------
+  # Frontend — static site (React/Vite build)
+  # ---------------------------------------------------------------------------
   - type: web
     name: crm-follow-up-web
     runtime: static
@@ -28,12 +45,23 @@ services:
       - key: VITE_API_URL
         sync: false
 
+  # ---------------------------------------------------------------------------
+  # Keepalive cron — prevents Render free-tier cold starts
+  # Pings the backend health endpoint every 10 minutes.
+  # ---------------------------------------------------------------------------
   - type: cron
     name: crm-api-keepalive
     runtime: python
     schedule: "*/10 * * * *"
     buildCommand: pip install httpx
-    startCommand: python -c "import os,httpx; httpx.get(os.environ['BACKEND_HEALTH_URL'], timeout=20).raise_for_status()"
+    startCommand: >
+      python -c "
+      import os, httpx;
+      url = os.environ['BACKEND_HEALTH_URL'];
+      r = httpx.get(url, timeout=20);
+      r.raise_for_status();
+      print(f'Keepalive OK: {r.status_code}')
+      "
     envVars:
       - key: BACKEND_HEALTH_URL
         sync: false

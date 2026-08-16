@@ -1,3 +1,12 @@
+"""
+Follow-ups router — call logs and follow-up management endpoints.
+
+Business rules:
+    - Follow-up dates cannot be in the past
+    - Duplicate pending follow-up at same date+time for same customer → HTTP 409
+    - Completing a follow-up sets status to 'completed'
+    - Deleting a customer cascades to all its follow-ups and call logs (DB level)
+"""
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
@@ -8,20 +17,26 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models import CallLog, Customer, Followup
-
+from ..schemas import CallLogCreate, CallLogOut, FollowupCreate, FollowupOut, FollowupUpdate
 
 router = APIRouter(tags=["CRM Follow-ups"])
 
 
-from ..schemas import CallLogCreate, CallLogOut, FollowupCreate, FollowupUpdate, FollowupOut
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-
-def get_customer_or_404(db: Session, customer_id: int) -> Customer:
+def _get_customer_or_404(db: Session, customer_id: int) -> Customer:
+    """Return the customer or raise HTTP 404."""
     customer = db.query(Customer).filter(Customer.id == customer_id).first()
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
     return customer
 
+
+# ---------------------------------------------------------------------------
+# Call logs
+# ---------------------------------------------------------------------------
 
 @router.post(
     "/api/customers/{customer_id}/calls",
@@ -33,7 +48,8 @@ def create_call_log(
     payload: CallLogCreate,
     db: Session = Depends(get_db),
 ):
-    get_customer_or_404(db, customer_id)
+    """Log a call for a customer."""
+    _get_customer_or_404(db, customer_id)
 
     call = CallLog(
         customer_id=customer_id,
@@ -41,7 +57,6 @@ def create_call_log(
         notes=payload.notes,
         called_at=datetime.utcnow(),
     )
-
     db.add(call)
     try:
         db.commit()
@@ -61,8 +76,8 @@ def list_call_logs(
     limit: int = Query(default=50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    get_customer_or_404(db, customer_id)
-
+    """Return recent call logs for a customer, newest first."""
+    _get_customer_or_404(db, customer_id)
     return (
         db.query(CallLog)
         .filter(CallLog.customer_id == customer_id)
@@ -71,6 +86,10 @@ def list_call_logs(
         .all()
     )
 
+
+# ---------------------------------------------------------------------------
+# Customer follow-ups
+# ---------------------------------------------------------------------------
 
 @router.post(
     "/api/customers/{customer_id}/followups",
@@ -82,7 +101,13 @@ def create_followup(
     payload: FollowupCreate,
     db: Session = Depends(get_db),
 ):
-    get_customer_or_404(db, customer_id)
+    """
+    Schedule a follow-up for a customer.
+
+    Rejects dates in the past and duplicate pending follow-ups at the same
+    date + time for the same customer.
+    """
+    _get_customer_or_404(db, customer_id)
 
     if payload.followup_date < date.today():
         raise HTTPException(
@@ -90,14 +115,22 @@ def create_followup(
             detail="Follow-up date cannot be in the past",
         )
 
-    duplicate = db.query(Followup.id).filter(
-        Followup.customer_id == customer_id,
-        Followup.followup_date == payload.followup_date.isoformat(),
-        Followup.followup_time == payload.followup_time,
-        Followup.status == "pending",
-    ).first()
+    # Duplicate check — uses the composite index on (customer_id, status, date, time)
+    duplicate = (
+        db.query(Followup.id)
+        .filter(
+            Followup.customer_id == customer_id,
+            Followup.followup_date == payload.followup_date.isoformat(),
+            Followup.followup_time == payload.followup_time,
+            Followup.status == "pending",
+        )
+        .first()
+    )
     if duplicate:
-        raise HTTPException(status_code=409, detail="An identical pending follow-up already exists")
+        raise HTTPException(
+            status_code=409,
+            detail="An identical pending follow-up already exists",
+        )
 
     followup = Followup(
         customer_id=customer_id,
@@ -108,7 +141,6 @@ def create_followup(
         notes=payload.notes,
         created_at=datetime.utcnow(),
     )
-
     db.add(followup)
     try:
         db.commit()
@@ -128,57 +160,56 @@ def list_customer_followups(
     status: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    get_customer_or_404(db, customer_id)
+    """Return follow-ups for a customer, optionally filtered by status."""
+    _get_customer_or_404(db, customer_id)
 
     query = db.query(Followup).filter(Followup.customer_id == customer_id)
-
     if status:
         query = query.filter(Followup.status == status)
 
     return (
         query
-        .order_by(
-            Followup.followup_date.asc(),
-            Followup.followup_time.asc(),
-        )
+        .order_by(Followup.followup_date.asc(), Followup.followup_time.asc())
         .all()
     )
 
 
-@router.get(
-    "/api/followups/today",
-    response_model=list[FollowupOut],
-)
+# ---------------------------------------------------------------------------
+# Global follow-up views (today / upcoming / overdue)
+# ---------------------------------------------------------------------------
+
+@router.get("/api/followups/today", response_model=list[FollowupOut])
 def todays_followups(
     status: str = Query(default="pending"),
     db: Session = Depends(get_db),
 ):
+    """Return follow-ups scheduled for today, ordered by time."""
+    today_str = date.today().isoformat()
     return (
         db.query(Followup)
         .filter(
-            Followup.followup_date == date.today().isoformat(),
+            Followup.followup_date == today_str,
             Followup.status == status,
         )
-        .order_by(
-            Followup.followup_time.asc(),
-            Followup.id.asc(),
-        )
+        .order_by(Followup.followup_time.asc(), Followup.id.asc())
         .all()
     )
 
 
-@router.get(
-    "/api/followups/upcoming",
-    response_model=list[FollowupOut],
-)
+@router.get("/api/followups/upcoming", response_model=list[FollowupOut])
 def upcoming_followups(
     days: int = Query(default=7, ge=1, le=90),
     status: str = Query(default="pending"),
     db: Session = Depends(get_db),
 ):
+    """
+    Return follow-ups scheduled within the next `days` days.
+
+    The range is inclusive of today so that today's follow-ups also appear
+    in the upcoming view (matching the frontend display logic).
+    """
     start = date.today()
     end = start + timedelta(days=days)
-
     return (
         db.query(Followup)
         .filter(
@@ -186,38 +217,41 @@ def upcoming_followups(
             Followup.followup_date <= end.isoformat(),
             Followup.status == status,
         )
-        .order_by(
-            Followup.followup_date.asc(),
-            Followup.followup_time.asc(),
-        )
+        .order_by(Followup.followup_date.asc(), Followup.followup_time.asc())
         .all()
     )
 
 
-@router.get('/api/followups/overdue', response_model=list[FollowupOut])
-def overdue_followups(status: str = Query(default='pending'), db: Session = Depends(get_db)):
+@router.get("/api/followups/overdue", response_model=list[FollowupOut])
+def overdue_followups(
+    status: str = Query(default="pending"),
+    db: Session = Depends(get_db),
+):
+    """Return follow-ups whose date is strictly before today."""
     today_str = date.today().isoformat()
-    return db.query(Followup).filter(
-        Followup.followup_date < today_str,
-        Followup.status == status
-    ).order_by(Followup.followup_date.asc()).all()
+    return (
+        db.query(Followup)
+        .filter(
+            Followup.followup_date < today_str,
+            Followup.status == status,
+        )
+        .order_by(Followup.followup_date.asc())
+        .all()
+    )
 
 
-@router.patch(
-    "/api/followups/{followup_id}",
-    response_model=FollowupOut,
-)
+# ---------------------------------------------------------------------------
+# Follow-up update / delete
+# ---------------------------------------------------------------------------
+
+@router.patch("/api/followups/{followup_id}", response_model=FollowupOut)
 def update_followup(
     followup_id: int,
     payload: FollowupUpdate,
     db: Session = Depends(get_db),
 ):
-    followup = (
-        db.query(Followup)
-        .filter(Followup.id == followup_id)
-        .first()
-    )
-
+    """Update a follow-up's date, time, status, reason, or notes."""
+    followup = db.query(Followup).filter(Followup.id == followup_id).first()
     if not followup:
         raise HTTPException(status_code=404, detail="Follow-up not found")
 
@@ -248,12 +282,8 @@ def delete_followup(
     followup_id: int,
     db: Session = Depends(get_db),
 ):
-    followup = (
-        db.query(Followup)
-        .filter(Followup.id == followup_id)
-        .first()
-    )
-
+    """Delete a follow-up by ID."""
+    followup = db.query(Followup).filter(Followup.id == followup_id).first()
     if not followup:
         raise HTTPException(status_code=404, detail="Follow-up not found")
 

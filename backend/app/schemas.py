@@ -1,14 +1,36 @@
+"""
+Pydantic schemas for request validation and response serialisation.
+
+All schemas use Pydantic v2 syntax (model_config, ConfigDict, etc.).
+"""
+from __future__ import annotations
+
 from datetime import date, datetime
 from typing import Literal, Optional
+
 from pydantic import BaseModel, ConfigDict, Field
+
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
 
 CustomerStatus = Literal["new", "contacted", "interested", "not_interested", "converted"]
 Priority = Literal["low", "medium", "high"]
 FollowupStatus = Literal["pending", "completed", "cancelled"]
 
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=255)
     password: str = Field(min_length=1, max_length=1024)
+
+
+# ---------------------------------------------------------------------------
+# Customer
+# ---------------------------------------------------------------------------
 
 class CustomerOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -32,6 +54,7 @@ class CustomerOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+
 class CustomerCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     phone: str | None = None
@@ -49,12 +72,34 @@ class CustomerCreate(BaseModel):
     status: CustomerStatus = "new"
     notes: str | None = None
 
+
+class CustomerUpdate(BaseModel):
+    """Partial update schema — all fields are optional."""
+
+    status: Optional[CustomerStatus] = None
+    priority: Optional[Priority] = None
+    notes: Optional[str] = None
+    service: Optional[str] = Field(default=None, max_length=255)
+    address: Optional[str] = None
+    region: Optional[str] = Field(default=None, max_length=255)
+    zone: Optional[str] = Field(default=None, max_length=255)
+    circle: Optional[str] = Field(default=None, max_length=255)
+    division: Optional[str] = Field(default=None, max_length=255)
+    subdivision: Optional[str] = Field(default=None, max_length=255)
+    business_unit: Optional[str] = Field(default=None, max_length=255)
+
+
 class PaginatedCustomers(BaseModel):
     items: list[CustomerOut]
     total: int
     page: int
     limit: int
     pages: int
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
 
 class DashboardStats(BaseModel):
     total_customers: int
@@ -63,9 +108,19 @@ class DashboardStats(BaseModel):
     upcoming_followups: int
     calls_today: int
 
+
+# ---------------------------------------------------------------------------
+# Call log
+# ---------------------------------------------------------------------------
+
 class CallLogCreate(BaseModel):
-    call_status: str = Field(min_length=1, max_length=50, pattern=r"^\S(?:.*\S)?$")
+    call_status: str = Field(
+        min_length=1,
+        max_length=50,
+        pattern=r"^\S(?:.*\S)?$",
+    )
     notes: Optional[str] = None
+
 
 class CallLogOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -76,18 +131,31 @@ class CallLogOut(BaseModel):
     notes: Optional[str]
     called_at: datetime
 
+
+# ---------------------------------------------------------------------------
+# Follow-up
+# ---------------------------------------------------------------------------
+
 class FollowupCreate(BaseModel):
     followup_date: date
-    followup_time: Optional[str] = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    followup_time: Optional[str] = Field(
+        default=None,
+        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+    )
     reason: Optional[str] = Field(default=None, max_length=255)
     notes: Optional[str] = None
 
+
 class FollowupUpdate(BaseModel):
     followup_date: Optional[date] = None
-    followup_time: Optional[str] = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    followup_time: Optional[str] = Field(
+        default=None,
+        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+    )
     status: Optional[FollowupStatus] = None
     reason: Optional[str] = Field(default=None, max_length=255)
     notes: Optional[str] = None
+
 
 class FollowupOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
