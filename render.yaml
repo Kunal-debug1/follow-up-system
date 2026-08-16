@@ -17,6 +17,12 @@ services:
         generateValue: true
       - key: CORS_ORIGINS
         sync: false
+      - key: IMPORT_BATCH_SIZE
+        value: "500"
+      - key: DB_POOL_SIZE
+        value: "3"
+      - key: WEB_CONCURRENCY
+        value: "1"
 
   - type: web
     name: crm-follow-up-web
