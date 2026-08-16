@@ -90,7 +90,14 @@ async def analyze(file: UploadFile = File(...), sheet: str | None = Query(defaul
             analysis = _analysis(path, file_type, current)
             results.append({"sheet": current, "rows": analysis["total_rows"], "valid_records": 0, "header_row": analysis["header_row"], "detected_mapping": analysis["detected_mapping"], "status": "skipped" if analysis["missing_required"] else "processed"})
         if file_type == "xlsx" and sheet is None:
-            return {"file": filename, "sheets": [item for item in selected if item], "selected_sheet": None, "mode": "all_sheets", "sheet_results": results, "total_records": sum(item["rows"] for item in results if item["status"] == "processed"), "records_with_phone": 0, "records_without_phone": 0}
+            # The UI previews and imports one worksheet at a time. Pick the
+            # first usable sheet so the next step always has a real selection.
+            selected_sheet = next((item["sheet"] for item in results if item["status"] == "processed"), None)
+            if not selected_sheet:
+                return {"file": filename, "sheets": [item for item in selected if item], "selected_sheet": None, "mode": "select_sheet", "sheet_results": results, "total_records": 0, "records_with_phone": 0, "records_without_phone": 0, "missing_required": ["name"]}
+            result = _analysis(path, file_type, selected_sheet)
+            result.update({"sheets": selected, "selected_sheet": selected_sheet, "mode": "single_sheet", "sheet_results": results})
+            return result
         result = _analysis(path, file_type, selected[0])
         result.update({"sheets": selected if file_type == "xlsx" else None, "selected_sheet": selected[0]})
         return result
@@ -120,6 +127,8 @@ async def preview(file: UploadFile = File(...), sheet: str | None = Query(defaul
 async def import_file(file: UploadFile = File(...), sheet: str | None = Query(default=None), db: Session = Depends(get_db)):
     filename = file.filename or "upload"; file_type = _file_type(filename); path, size = await _save_upload(file, filename); started = monotonic()
     try:
+        if file_type == "xlsx" and not sheet:
+            raise HTTPException(400, "Choose a worksheet before importing an XLSX file.")
         selected = _sheets(path, file_type, sheet)
         analyses = [(current, _analysis(path, file_type, current)) for current in selected]
         for _, analysis in analyses: _validate(analysis)
@@ -127,7 +136,7 @@ async def import_file(file: UploadFile = File(...), sheet: str | None = Query(de
         result = import_record_batches(db, filename, file_type, records)
         if not result["total_rows"]:
             raise HTTPException(422, "No valid customer records found.")
-        result.update({"mode": "single_sheet" if file_type == "xlsx" and sheet else "all_sheets" if file_type == "xlsx" else "csv", "sheet": sheet, "sheets": [current for current in selected if current], "sheets_processed": len(selected)})
+        result.update({"mode": "single_sheet" if file_type == "xlsx" else "csv", "sheet": sheet, "sheets": [current for current in selected if current], "sheets_processed": len(selected)})
         logger.info("import complete filename=%s size=%d sheet=%s rows=%d imported=%d skipped=%d seconds=%.3f", filename, size, sheet or "all", result["total_rows"], result["imported_rows"], result["skipped_rows"] + result["duplicate_rows"], monotonic()-started)
         return result
     except ValueError as exc:
@@ -139,3 +148,4 @@ async def import_file(file: UploadFile = File(...), sheet: str | None = Query(de
         raise HTTPException(500, "Import could not be completed. No details were exposed.")
     finally:
         path.unlink(missing_ok=True)
+
