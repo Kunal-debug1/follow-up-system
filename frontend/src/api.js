@@ -30,9 +30,13 @@ async function request(path, options = {}) {
       data?.detail ||
       `Request failed (${response.status})`;
 
-    throw new Error(
+    const error = new Error(
       typeof message === "string" ? message : JSON.stringify(message)
     );
+    // Attach the HTTP status code to the error so callers can branch on it
+    // without string-matching the error message.
+    error.status = response.status;
+    throw error;
   }
 
   return data;
@@ -170,6 +174,13 @@ export const api = {
       headers: {
         "Content-Type": "application/json",
       },
+      body: JSON.stringify(body),
+    }),
+
+  updateCustomer: (id, body) =>
+    request(`/api/customers/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
 
