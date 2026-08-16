@@ -1,27 +1,32 @@
-const API_BASE = import.meta.env.VITE_API_URL || "";
+const API_BASE = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
 
 async function request(path, options = {}) {
-  const token = localStorage.getItem('crm_token');
-  const headers = { ...(options.headers || {}) };
+  const token = localStorage.getItem("crm_token");
+
+  const headers = new Headers(options.headers || {});
+
   if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
+    headers.set("Authorization", `Bearer ${token}`);
   }
 
-  const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers,
+  });
 
   let data = null;
 
   try {
     data = await response.json();
   } catch {
-    data = null;
+    // Response has no JSON body.
   }
 
-  if (response.status === 401 && path !== '/api/auth/login') {
-    localStorage.removeItem('crm_token');
-    localStorage.removeItem('crm_user');
+  if (response.status === 401 && path !== "/api/auth/login") {
+    localStorage.removeItem("crm_token");
+    localStorage.removeItem("crm_user");
     window.location.reload();
-    throw new Error('Session expired');
+    throw new Error("Session expired. Please log in again.");
   }
 
   if (!response.ok) {
@@ -31,12 +36,15 @@ async function request(path, options = {}) {
       `Request failed (${response.status})`;
 
     throw new Error(
-      typeof message === "string" ? message : JSON.stringify(message)
+      typeof message === "string"
+        ? message
+        : JSON.stringify(message)
     );
   }
 
   return data;
 }
+
 
 function normalizePhone(value) {
   if (value === null || value === undefined) {
