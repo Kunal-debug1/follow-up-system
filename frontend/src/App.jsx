@@ -23,6 +23,9 @@ import { CallsPage } from "./components/CallsPage";
 import { ImportPage } from "./components/ImportPage";
 import { CustomerDrawer } from "./components/CustomerDrawer";
 import { CustomerFormModal } from "./components/CustomerFormModal";
+import { EditCustomerModal } from "./components/EditCustomerModal";
+import { CompleteFollowupModal } from "./components/CompleteFollowupModal";
+import { ConfirmModal } from "./components/ConfirmModal";
 import { Modal } from "./components/common/Modal";
 
 // ---------------------------------------------------------------------------
@@ -77,6 +80,7 @@ function App() {
   const [totalPages, setTotalPages] = useState(1);
   const [pageLimit, setPageLimit] = useState(50);
   const [search, setSearch] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
 
   // Follow-up / dashboard state
   const [today, setToday] = useState([]);
@@ -88,11 +92,22 @@ function App() {
   const [selectedCustomer, setSelectedCustomer] = useState(null);
   const [customerCalls, setCustomerCalls] = useState([]);
   const [customerFollowups, setCustomerFollowups] = useState([]);
+  const [timelineRefreshKey, setTimelineRefreshKey] = useState(0);
 
   // Modal state
   const [callModal, setCallModal] = useState(false);
   const [followupModal, setFollowupModal] = useState(false);
   const [customerModal, setCustomerModal] = useState(false);
+  const [editCustomerModal, setEditCustomerModal] = useState(false);
+  const [completeFollowupModal, setCompleteFollowupModal] = useState(false);
+  const [followupToComplete, setFollowupToComplete] = useState(null);
+
+  // Confirmation modals
+  const [archiveConfirm, setArchiveConfirm] = useState(false);
+  const [restoreConfirm, setRestoreConfirm] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [archiveLoading, setArchiveLoading] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   // Call form
   const [callStatus, setCallStatus] = useState("busy");
@@ -103,6 +118,7 @@ function App() {
   const [followupTime, setFollowupTime] = useState("");
   const [followupReason, setFollowupReason] = useState("Customer busy");
   const [followupNotes, setFollowupNotes] = useState("");
+  const [followupPriority, setFollowupPriority] = useState("medium");
 
   // UI state
   const [loading, setLoading] = useState(true);
@@ -120,8 +136,10 @@ function App() {
   const showToast = (message, type = "success") => {
     clearTimeout(toastTimeoutRef.current);
     setToast({ message, type });
-    toastTimeoutRef.current = setTimeout(() => setToast(null), 3000);
+    toastTimeoutRef.current = setTimeout(() => setToast(null), 3500);
   };
+
+  const refreshTimeline = () => setTimelineRefreshKey((k) => k + 1);
 
   // ---------------------------------------------------------------------------
   // Data loading
@@ -147,7 +165,7 @@ function App() {
     }
   };
 
-  const loadCustomers = async (searchTerm = "", p = 1, limit = pageLimit) => {
+  const loadCustomers = async (searchTerm = "", p = 1, limit = pageLimit, archived = showArchived) => {
     customerRequestRef.current?.abort();
     const controller = new AbortController();
     customerRequestRef.current = controller;
@@ -158,6 +176,7 @@ function App() {
         search: searchTerm,
         page: p,
         limit,
+        archived,
         signal: controller.signal,
       });
       if (customerRequestRef.current !== controller) return;
@@ -197,14 +216,14 @@ function App() {
     }
   }, [activePage, isAuthenticated]);
 
-  // Debounced customer search
+  // Debounced customer search (also re-fires when showArchived changes)
   useEffect(() => {
     if (!isAuthenticated) return;
     const timer = setTimeout(() => {
-      loadCustomers(search, 1, pageLimit);
+      loadCustomers(search, 1, pageLimit, showArchived);
     }, 300);
     return () => clearTimeout(timer);
-  }, [search, pageLimit, isAuthenticated]);
+  }, [search, pageLimit, isAuthenticated, showArchived]);
 
   // ---------------------------------------------------------------------------
   // Auth handlers
@@ -250,13 +269,85 @@ function App() {
     setSelectedCustomer(null);
     setCallModal(false);
     setFollowupModal(false);
+    setEditCustomerModal(false);
+    setArchiveConfirm(false);
+    setRestoreConfirm(false);
+    setDeleteConfirm(false);
   };
 
   const handleCustomerCreated = async () => {
     setCustomerModal(false);
     showToast("Customer created successfully");
-    await loadCustomers(search, 1, pageLimit);
+    await loadCustomers(search, 1, pageLimit, showArchived);
     await loadOverview();
+  };
+
+  const handleCustomerEdited = async (updatedCustomer) => {
+    setEditCustomerModal(false);
+    setSelectedCustomer(updatedCustomer);
+    showToast("Customer updated successfully");
+    await loadCustomers(search, page, pageLimit, showArchived);
+  };
+
+  // Archive
+  const handleArchiveConfirm = async () => {
+    if (!selectedCustomer) return;
+    try {
+      setArchiveLoading(true);
+      await api.archiveCustomer(selectedCustomer.id);
+      setArchiveConfirm(false);
+      closeCustomer();
+      showToast(`${selectedCustomer.name} has been archived`);
+      await loadCustomers(search, 1, pageLimit, showArchived);
+      await loadOverview();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setArchiveLoading(false);
+    }
+  };
+
+  // Restore
+  const handleRestoreConfirm = async () => {
+    if (!selectedCustomer) return;
+    try {
+      setArchiveLoading(true);
+      const restored = await api.restoreCustomer(selectedCustomer.id);
+      setRestoreConfirm(false);
+      setSelectedCustomer((prev) => ({ ...prev, is_archived: false, archived_at: null, archived_by: null }));
+      showToast(`${selectedCustomer.name} has been restored`);
+      await loadCustomers(search, 1, pageLimit, showArchived);
+      await loadOverview();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setArchiveLoading(false);
+    }
+  };
+
+  // Permanent delete
+  const handleDeleteConfirm = async () => {
+    if (!selectedCustomer) return;
+    try {
+      setDeleteLoading(true);
+      await api.deleteCustomerPermanently(selectedCustomer.id);
+      setDeleteConfirm(false);
+      closeCustomer();
+      showToast(`${selectedCustomer.name} permanently deleted`, "error");
+      await loadCustomers(search, 1, pageLimit, showArchived);
+      await loadOverview();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
+  // Toggle archived view
+  const handleToggleArchived = () => {
+    setShowArchived((v) => !v);
+    setSearch("");
+    setPage(1);
   };
 
   // ---------------------------------------------------------------------------
@@ -275,6 +366,7 @@ function App() {
       setCustomerCalls(calls);
       setCallModal(false);
       setCallNotes("");
+      refreshTimeline();
       await loadOverview();
       showToast("Call logged successfully");
     } catch (err) {
@@ -297,6 +389,7 @@ function App() {
         followup_time: followupTime || null,
         reason: followupReason || null,
         notes: followupNotes || null,
+        priority: followupPriority,
       });
       const followups = await api.followups(selectedCustomer.id);
       setCustomerFollowups(followups);
@@ -304,6 +397,8 @@ function App() {
       setFollowupDate("");
       setFollowupTime("");
       setFollowupNotes("");
+      setFollowupPriority("medium");
+      refreshTimeline();
       await loadOverview();
       showToast("Follow-up scheduled successfully");
     } catch (err) {
@@ -313,16 +408,38 @@ function App() {
     }
   };
 
-  const completeFollowup = async (id) => {
-    try {
-      await api.updateFollowup(id, { status: "completed" });
-      await loadOverview();
-      if (selectedCustomer) {
-        setCustomerFollowups(await api.followups(selectedCustomer.id));
-      }
-      showToast("Follow-up marked as completed");
-    } catch (err) {
-      setError(err.message);
+  // Open the complete modal (accepts a followup object)
+  const openCompleteFollowup = (followup) => {
+    setFollowupToComplete(followup);
+    setCompleteFollowupModal(true);
+  };
+
+  // Called from FollowupsPage or CustomerDrawer
+  const handleCompleteFollowup = (followupOrId) => {
+    // FollowupsPage and CustomerDrawer now pass the full followup object
+    if (typeof followupOrId === "object" && followupOrId !== null) {
+      openCompleteFollowup(followupOrId);
+    } else {
+      // Fallback: if only an ID was passed, build a minimal object
+      openCompleteFollowup({ id: followupOrId });
+    }
+  };
+
+  const handleCompleteFollowupSuccess = async (result) => {
+    setCompleteFollowupModal(false);
+    setFollowupToComplete(null);
+
+    const msg = result.next_followup
+      ? "Follow-up completed. Next follow-up scheduled."
+      : "Follow-up marked as completed.";
+    showToast(msg);
+
+    // Refresh follow-ups and overview
+    await loadOverview();
+    if (selectedCustomer) {
+      const followups = await api.followups(selectedCustomer.id);
+      setCustomerFollowups(followups);
+      refreshTimeline();
     }
   };
 
@@ -455,7 +572,9 @@ function App() {
             totalCustomers={totalCustomers}
             pageLimit={pageLimit}
             setPageLimit={setPageLimit}
-            onPageChange={(p) => loadCustomers(search, p, pageLimit)}
+            onPageChange={(p) => loadCustomers(search, p, pageLimit, showArchived)}
+            showArchived={showArchived}
+            onToggleArchived={handleToggleArchived}
           />
         )}
 
@@ -465,7 +584,7 @@ function App() {
             today={today}
             upcoming={upcoming}
             onCustomer={openCustomer}
-            onComplete={completeFollowup}
+            onComplete={handleCompleteFollowup}
           />
         )}
 
@@ -484,7 +603,12 @@ function App() {
             onClose={closeCustomer}
             onCall={() => setCallModal(true)}
             onFollowup={() => setFollowupModal(true)}
-            onComplete={completeFollowup}
+            onComplete={handleCompleteFollowup}
+            onEdit={() => setEditCustomerModal(true)}
+            onArchive={() => setArchiveConfirm(true)}
+            onRestore={() => setRestoreConfirm(true)}
+            onPermanentDelete={() => setDeleteConfirm(true)}
+            timelineRefreshKey={timelineRefreshKey}
           />
         )}
 
@@ -560,6 +684,15 @@ function App() {
               onChange={(e) => setFollowupNotes(e.target.value)}
               placeholder="Add a short note..."
             />
+            <label>Priority</label>
+            <select
+              value={followupPriority}
+              onChange={(e) => setFollowupPriority(e.target.value)}
+            >
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
             <div className="modal-actions">
               <button
                 className="button secondary"
@@ -583,6 +716,67 @@ function App() {
           <CustomerFormModal
             onClose={() => setCustomerModal(false)}
             onSuccess={handleCustomerCreated}
+          />
+        )}
+
+        {/* Edit customer modal */}
+        {editCustomerModal && selectedCustomer && (
+          <EditCustomerModal
+            customer={selectedCustomer}
+            onClose={() => setEditCustomerModal(false)}
+            onSuccess={handleCustomerEdited}
+          />
+        )}
+
+        {/* Complete follow-up modal */}
+        {completeFollowupModal && followupToComplete && (
+          <CompleteFollowupModal
+            followup={followupToComplete}
+            onClose={() => {
+              setCompleteFollowupModal(false);
+              setFollowupToComplete(null);
+            }}
+            onSuccess={handleCompleteFollowupSuccess}
+          />
+        )}
+
+        {/* Archive confirmation */}
+        {archiveConfirm && selectedCustomer && (
+          <ConfirmModal
+            title="Archive customer?"
+            message={`Archive ${selectedCustomer.name}?`}
+            subMessage="Customer data and history will be preserved. The customer can be restored at any time."
+            confirmLabel="Archive"
+            onConfirm={handleArchiveConfirm}
+            onCancel={() => setArchiveConfirm(false)}
+            loading={archiveLoading}
+          />
+        )}
+
+        {/* Restore confirmation */}
+        {restoreConfirm && selectedCustomer && (
+          <ConfirmModal
+            title="Restore customer?"
+            message={`Restore ${selectedCustomer.name} to active status?`}
+            subMessage="The customer will reappear in the active customer list."
+            confirmLabel="Restore"
+            onConfirm={handleRestoreConfirm}
+            onCancel={() => setRestoreConfirm(false)}
+            loading={archiveLoading}
+          />
+        )}
+
+        {/* Permanent delete confirmation */}
+        {deleteConfirm && selectedCustomer && (
+          <ConfirmModal
+            title="Permanently delete customer?"
+            message={`Delete ${selectedCustomer.name} forever?`}
+            subMessage="This permanently deletes the customer and ALL related calls and follow-ups. This action cannot be undone. Admin access required."
+            confirmLabel="Delete Permanently"
+            danger={true}
+            onConfirm={handleDeleteConfirm}
+            onCancel={() => setDeleteConfirm(false)}
+            loading={deleteLoading}
           />
         )}
       </main>

@@ -6,6 +6,20 @@ Business rules:
     - Duplicate pending follow-up at same date+time for same customer → HTTP 409
     - Completing a follow-up sets status to 'completed'
     - Deleting a customer cascades to all its follow-ups and call logs (DB level)
+
+Existing endpoints preserved with identical signatures:
+    POST   /api/customers/{id}/calls
+    GET    /api/customers/{id}/calls
+    POST   /api/customers/{id}/followups
+    GET    /api/customers/{id}/followups
+    GET    /api/followups/today
+    GET    /api/followups/upcoming
+    GET    /api/followups/overdue
+    PATCH  /api/followups/{id}
+    DELETE /api/followups/{id}
+
+New endpoint:
+    POST   /api/followups/{id}/complete — completion workflow with outcome + optional next follow-up
 """
 from __future__ import annotations
 
@@ -15,9 +29,18 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from ..auth import require_auth
 from ..database import get_db
 from ..models import CallLog, Customer, Followup
-from ..schemas import CallLogCreate, CallLogOut, FollowupCreate, FollowupOut, FollowupUpdate
+from ..schemas import (
+    CallLogCreate,
+    CallLogOut,
+    CompleteFollowupOut,
+    CompleteFollowupRequest,
+    FollowupCreate,
+    FollowupOut,
+    FollowupUpdate,
+)
 
 router = APIRouter(tags=["CRM Follow-ups"])
 
@@ -32,6 +55,14 @@ def _get_customer_or_404(db: Session, customer_id: int) -> Customer:
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
     return customer
+
+
+def _get_followup_or_404(db: Session, followup_id: int) -> Followup:
+    """Return the follow-up or raise HTTP 404."""
+    followup = db.query(Followup).filter(Followup.id == followup_id).first()
+    if not followup:
+        raise HTTPException(status_code=404, detail="Follow-up not found")
+    return followup
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +170,7 @@ def create_followup(
         status="pending",
         reason=payload.reason,
         notes=payload.notes,
+        priority=payload.priority,
         created_at=datetime.utcnow(),
     )
     db.add(followup)
@@ -241,6 +273,88 @@ def overdue_followups(
 
 
 # ---------------------------------------------------------------------------
+# Follow-up complete (new endpoint)
+# ---------------------------------------------------------------------------
+
+@router.post("/api/followups/{followup_id}/complete", response_model=CompleteFollowupOut)
+def complete_followup(
+    followup_id: int,
+    payload: CompleteFollowupRequest,
+    db: Session = Depends(get_db),
+    current_user: str = Depends(require_auth),
+):
+    """
+    Mark a follow-up as completed with an outcome.
+
+    Optionally schedules the next follow-up for the same customer.
+
+    Steps:
+    1. Validate the follow-up exists and is pending.
+    2. Set status=completed, outcome, notes, completed_at, completed_by.
+    3. If create_next=True and next_date is valid, create the next follow-up.
+    4. Return both the completed follow-up and the new follow-up (if created).
+    """
+    followup = _get_followup_or_404(db, followup_id)
+
+    if followup.status not in ("pending", "missed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot complete a follow-up with status '{followup.status}'",
+        )
+
+    now = datetime.utcnow()
+
+    # Mark the follow-up as completed
+    followup.status = "completed"
+    followup.outcome = payload.outcome
+    if payload.notes is not None:
+        followup.notes = payload.notes
+    followup.completed_at = now
+    followup.completed_by = current_user
+
+    next_followup: Followup | None = None
+
+    # Optionally create the next follow-up
+    if payload.create_next:
+        if not payload.next_date:
+            raise HTTPException(
+                status_code=400,
+                detail="next_date is required when create_next is true",
+            )
+        if payload.next_date < date.today():
+            raise HTTPException(
+                status_code=400,
+                detail="Next follow-up date cannot be in the past",
+            )
+
+        next_followup = Followup(
+            customer_id=followup.customer_id,
+            followup_date=payload.next_date.isoformat(),
+            followup_time=payload.next_time,
+            status="pending",
+            reason=payload.next_reason or followup.reason,
+            priority=followup.priority,
+            created_at=now,
+        )
+        db.add(next_followup)
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(followup)
+    if next_followup:
+        db.refresh(next_followup)
+
+    return CompleteFollowupOut(
+        completed=followup,
+        next_followup=next_followup,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Follow-up update / delete
 # ---------------------------------------------------------------------------
 
@@ -250,10 +364,8 @@ def update_followup(
     payload: FollowupUpdate,
     db: Session = Depends(get_db),
 ):
-    """Update a follow-up's date, time, status, reason, or notes."""
-    followup = db.query(Followup).filter(Followup.id == followup_id).first()
-    if not followup:
-        raise HTTPException(status_code=404, detail="Follow-up not found")
+    """Update a follow-up's date, time, status, reason, notes, outcome, or priority."""
+    followup = _get_followup_or_404(db, followup_id)
 
     data = payload.model_dump(exclude_unset=True)
 
@@ -283,9 +395,7 @@ def delete_followup(
     db: Session = Depends(get_db),
 ):
     """Delete a follow-up by ID."""
-    followup = db.query(Followup).filter(Followup.id == followup_id).first()
-    if not followup:
-        raise HTTPException(status_code=404, detail="Follow-up not found")
+    followup = _get_followup_or_404(db, followup_id)
 
     db.delete(followup)
     try:

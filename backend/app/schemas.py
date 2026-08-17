@@ -16,7 +16,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 CustomerStatus = Literal["new", "contacted", "interested", "not_interested", "converted"]
 Priority = Literal["low", "medium", "high"]
-FollowupStatus = Literal["pending", "completed", "cancelled"]
+# 'missed' added — existing pending/completed/cancelled values are unchanged
+FollowupStatus = Literal["pending", "completed", "missed", "cancelled"]
+FollowupOutcome = Literal[
+    "interested",
+    "not_interested",
+    "call_back",
+    "no_answer",
+    "busy",
+    "converted",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +60,10 @@ class CustomerOut(BaseModel):
     status: CustomerStatus
     priority: Priority
     notes: str | None = None
+    # Archive fields
+    is_archived: bool = False
+    archived_at: datetime | None = None
+    archived_by: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -74,8 +87,15 @@ class CustomerCreate(BaseModel):
 
 
 class CustomerUpdate(BaseModel):
-    """Partial update schema — all fields are optional."""
+    """Partial update schema — all fields are optional.
 
+    Includes name, phone, email, consumer_number for full edit support.
+    Duplicate detection for phone/consumer_number is enforced in the service layer.
+    """
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    phone: Optional[str] = Field(default=None, max_length=50)
+    email: Optional[str] = Field(default=None, max_length=255)
+    consumer_number: Optional[str] = Field(default=None, max_length=100)
     status: Optional[CustomerStatus] = None
     priority: Optional[Priority] = None
     notes: Optional[str] = None
@@ -89,12 +109,39 @@ class CustomerUpdate(BaseModel):
     business_unit: Optional[str] = Field(default=None, max_length=255)
 
 
+class CustomerArchiveOut(BaseModel):
+    """Response after archiving or restoring a customer."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    is_archived: bool
+    archived_at: datetime | None = None
+    archived_by: str | None = None
+
+
 class PaginatedCustomers(BaseModel):
     items: list[CustomerOut]
     total: int
     page: int
     limit: int
     pages: int
+
+
+# ---------------------------------------------------------------------------
+# Timeline
+# ---------------------------------------------------------------------------
+
+class TimelineEvent(BaseModel):
+    """A single event in the customer timeline (call, follow-up, or creation)."""
+    event_type: str          # 'created', 'call', 'followup'
+    timestamp: datetime
+    title: str
+    subtitle: str | None = None
+    outcome: str | None = None
+    status: str | None = None
+    notes: str | None = None
+    event_id: int | None = None  # the id of the underlying call/followup record
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +191,7 @@ class FollowupCreate(BaseModel):
     )
     reason: Optional[str] = Field(default=None, max_length=255)
     notes: Optional[str] = None
+    priority: Priority = "medium"
 
 
 class FollowupUpdate(BaseModel):
@@ -155,6 +203,22 @@ class FollowupUpdate(BaseModel):
     status: Optional[FollowupStatus] = None
     reason: Optional[str] = Field(default=None, max_length=255)
     notes: Optional[str] = None
+    outcome: Optional[FollowupOutcome] = None
+    priority: Optional[Priority] = None
+
+
+class CompleteFollowupRequest(BaseModel):
+    """Request body for the POST /api/followups/{id}/complete endpoint."""
+    outcome: FollowupOutcome
+    notes: Optional[str] = None
+    # If True, a new follow-up is scheduled for this customer
+    create_next: bool = False
+    next_date: Optional[date] = None
+    next_time: Optional[str] = Field(
+        default=None,
+        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+    )
+    next_reason: Optional[str] = Field(default=None, max_length=255)
 
 
 class FollowupOut(BaseModel):
@@ -167,4 +231,14 @@ class FollowupOut(BaseModel):
     status: str
     reason: Optional[str]
     notes: Optional[str]
+    outcome: Optional[str] = None
+    priority: str = "medium"
+    completed_at: Optional[datetime] = None
+    completed_by: Optional[str] = None
     created_at: datetime
+
+
+class CompleteFollowupOut(BaseModel):
+    """Response after completing a follow-up (may include a new follow-up)."""
+    completed: FollowupOut
+    next_followup: Optional[FollowupOut] = None

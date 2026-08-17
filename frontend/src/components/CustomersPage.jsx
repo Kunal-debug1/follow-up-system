@@ -1,8 +1,11 @@
-import { Phone, Plus, Search, ChevronRight } from "lucide-react";
+import { Phone, Plus, Search, ChevronRight, Archive } from "lucide-react";
 import { EmptyState } from "./common/EmptyState";
 import { StatusPill } from "./common/StatusPill";
 import { Pagination } from "./common/Pagination";
 import { displayPhone } from "../utils/formatters";
+
+const PRIORITY_LABELS = { high: "High", medium: "Medium", low: "Low" };
+const PRIORITY_CLASS = { high: "priority-high", medium: "priority-medium", low: "priority-low" };
 
 function CustomerTable({ customers, onCustomer }) {
   return (
@@ -15,12 +18,13 @@ function CustomerTable({ customers, onCustomer }) {
             <th>Consumer no.</th>
             <th>Location</th>
             <th>Status</th>
+            <th>Priority</th>
             <th></th>
           </tr>
         </thead>
         <tbody>
           {customers.map((c) => (
-            <tr key={c.id}>
+            <tr key={c.id} className={c.is_archived ? "archived-row" : ""}>
               <td>
                 <button className="customer-link" onClick={() => onCustomer(c)}>
                   <span className="avatar soft small">
@@ -50,6 +54,11 @@ function CustomerTable({ customers, onCustomer }) {
               <td>{c.region || c.zone || "—"}</td>
               <td><StatusPill status={c.status} /></td>
               <td>
+                <span className={`priority-badge ${PRIORITY_CLASS[c.priority] || "priority-medium"}`}>
+                  {PRIORITY_LABELS[c.priority] || "Medium"}
+                </span>
+              </td>
+              <td>
                 <button className="row-action" onClick={() => onCustomer(c)}>
                   <ChevronRight size={17} />
                 </button>
@@ -75,13 +84,15 @@ export function CustomersPage({
   pageLimit,
   setPageLimit,
   onPageChange,
+  showArchived,
+  onToggleArchived,
 }) {
   return (
     <div className="page-content">
       <div className="page-heading">
         <div>
           <p className="eyebrow">Customer database</p>
-          <h2>Customers</h2>
+          <h2>{showArchived ? "Archived Customers" : "Customers"}</h2>
           <p>Search and open a customer to manage calls and follow-ups.</p>
         </div>
       </div>
@@ -92,18 +103,35 @@ export function CustomersPage({
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search name, phone, consumer number, email..."
+              placeholder="Search name, phone, consumer number, email…"
             />
           </div>
-          <button className="button primary" onClick={onCreateCustomer}>
-            <Plus size={16} /> Add Customer
+
+          {/* Archived toggle */}
+          <button
+            className={`button ${showArchived ? "primary" : "secondary"}`}
+            onClick={onToggleArchived}
+            title={showArchived ? "Show active customers" : "Show archived customers"}
+          >
+            <Archive size={15} />
+            {showArchived ? "Active" : "Archived"}
           </button>
+
+          {!showArchived && (
+            <button className="button primary" onClick={onCreateCustomer}>
+              <Plus size={16} /> Add Customer
+            </button>
+          )}
         </div>
 
         {loading && customers.length === 0 ? (
           <div className="loading">Loading customers…</div>
         ) : customers.length === 0 ? (
-          <EmptyState icon={Search} title="No customers found" text="Try a different search." />
+          <EmptyState
+            icon={showArchived ? Archive : Search}
+            title={showArchived ? "No archived customers" : "No customers found"}
+            text={showArchived ? "No customers have been archived." : "Try a different search."}
+          />
         ) : (
           <>
             <CustomerTable customers={customers} onCustomer={onCustomer} />

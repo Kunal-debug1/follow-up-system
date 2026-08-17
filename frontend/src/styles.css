@@ -491,3 +491,291 @@ tbody tr:hover { background: #fcfdff; }
   color: #9ca3af;
   margin: 1.5rem 0 0;
 }
+
+/* ==========================================================================
+   NEW FEATURE STYLES — added non-destructively below all existing styles
+   ========================================================================== */
+
+/* ---------------------------------------------------------------------------
+   WhatsApp button
+   --------------------------------------------------------------------------- */
+.whatsapp-btn {
+  color: #fff;
+  background: #25d366;
+  border-color: #25d366;
+}
+.whatsapp-btn:hover {
+  background: #1ebe57;
+  border-color: #1ebe57;
+}
+
+/* ---------------------------------------------------------------------------
+   Priority badges
+   --------------------------------------------------------------------------- */
+.priority-badge {
+  display: inline-flex;
+  border-radius: 5px;
+  padding: 3px 7px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.priority-high  { background: #fef3f2; color: #b42318; }
+.priority-medium { background: #fffaeb; color: #b54708; }
+.priority-low   { background: #f0fdf4; color: #15803d; }
+
+/* ---------------------------------------------------------------------------
+   Outcome pills
+   --------------------------------------------------------------------------- */
+.outcome-pill {
+  display: inline-flex;
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.outcome-interested  { background: #ecfdf3; color: #027a48; }
+.outcome-converted   { background: #ecfdf3; color: #15803d; }
+.outcome-call_back   { background: #eff6ff; color: #2563eb; }
+.outcome-busy        { background: #fffaeb; color: #b54708; }
+.outcome-no_answer   { background: #f8fafc; color: #475467; }
+.outcome-not_interested { background: #fef3f2; color: #b42318; }
+
+/* ---------------------------------------------------------------------------
+   Customer drawer management action buttons
+   --------------------------------------------------------------------------- */
+.drawer-mgmt-actions {
+  display: flex;
+  gap: 6px;
+  padding: 0 20px 12px;
+  flex-wrap: wrap;
+}
+.mgmt-btn {
+  border: 1px solid #e5e7eb;
+  background: #fff;
+  color: #6b7280;
+  border-radius: 7px;
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: .15s;
+}
+.mgmt-btn:hover   { background: #f9fafb; color: #374151; }
+.mgmt-btn.archive:hover { background: #fffbeb; color: #b45309; border-color: #fde68a; }
+.mgmt-btn.restore:hover { background: #f0fdf4; color: #15803d; border-color: #bbf7d0; }
+.mgmt-btn.delete:hover  { background: #fef2f2; color: #b42318; border-color: #fecaca; }
+
+/* Danger button (permanent delete confirm) */
+.btn-danger {
+  color: #fff;
+  background: #dc2626;
+  border-color: #dc2626;
+}
+.btn-danger:hover { background: #b91c1c; }
+
+/* ---------------------------------------------------------------------------
+   Archived customer indicators
+   --------------------------------------------------------------------------- */
+.archived-row { opacity: .65; }
+.archived-badge {
+  display: inline-block;
+  background: #fef3c7;
+  color: #92400e;
+  border-radius: 5px;
+  padding: 2px 7px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.archived-info strong { color: #92400e; font-size: 10px; }
+
+/* ---------------------------------------------------------------------------
+   Follow-up row enhancements
+   --------------------------------------------------------------------------- */
+.followup-row-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.followup-row-header strong { font-size: 11px; }
+.followup-notes-preview {
+  display: block;
+  color: #8a94a6;
+  font-size: 9px;
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+}
+.followup-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+/* Overdue card accent */
+.card-overdue {
+  border-color: #fecaca !important;
+  grid-column: 1 / -1;
+}
+.card-overdue .section-heading {
+  background: #fef2f2;
+}
+.card-overdue .section-heading h3 {
+  color: #b42318;
+}
+.followups-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+@media (max-width: 780px) {
+  .followups-grid { grid-template-columns: 1fr; }
+}
+
+/* ---------------------------------------------------------------------------
+   Confirm modal
+   --------------------------------------------------------------------------- */
+.confirm-modal {
+  max-width: 420px;
+}
+.confirm-modal-icon-wrap {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  background: #fef3f2;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+}
+.confirm-icon-danger { color: #b42318; }
+.confirm-icon-warn   { color: #b45309; }
+.confirm-modal .modal-header {
+  gap: 12px;
+}
+.confirm-modal-message {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: #374151;
+}
+.confirm-modal-sub {
+  margin: 0 0 18px;
+  font-size: 11px;
+  color: #6b7280;
+  line-height: 1.6;
+}
+
+/* ---------------------------------------------------------------------------
+   Complete follow-up modal enhancements
+   --------------------------------------------------------------------------- */
+.next-followup-toggle {
+  margin: 14px 0 0;
+  padding: 12px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  border-radius: 9px;
+}
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #374151;
+  cursor: pointer;
+}
+.checkbox-label input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: #2563eb;
+}
+.next-followup-fields {
+  margin-top: 12px;
+  padding: 14px;
+  background: #f0f7ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 9px;
+  display: grid;
+  gap: 10px;
+}
+
+/* ---------------------------------------------------------------------------
+   Timeline
+   --------------------------------------------------------------------------- */
+.timeline-wrap { padding: 16px 20px 20px; }
+.timeline { display: flex; flex-direction: column; gap: 0; }
+.timeline-item { display: flex; gap: 12px; align-items: flex-start; }
+.timeline-connector { display: flex; flex-direction: column; align-items: center; flex: 0 0 auto; }
+.timeline-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: #f1f5f9;
+  color: #64748b;
+  flex: 0 0 auto;
+  z-index: 1;
+}
+.timeline-icon-created  { background: #eff6ff; color: #2563eb; }
+.timeline-icon-call     { background: #f0fdf4; color: #15803d; }
+.timeline-icon-followup { background: #fefce8; color: #b45309; }
+.timeline-icon-status-completed { background: #ecfdf3; color: #15803d; }
+.timeline-icon-status-missed    { background: #fef3f2; color: #b42318; }
+.timeline-icon-status-cancelled { background: #f8fafc; color: #94a3b8; }
+.timeline-line {
+  width: 1px;
+  flex: 1;
+  background: #e2e8f0;
+  min-height: 20px;
+  margin: 3px 0;
+}
+.timeline-content {
+  padding-bottom: 16px;
+  min-width: 0;
+  flex: 1;
+}
+.timeline-title  { font-size: 11px; font-weight: 600; color: #334155; margin-bottom: 3px; }
+.timeline-subtitle { font-size: 10px; color: #64748b; margin: 3px 0; line-height: 1.4; }
+.timeline-notes  { font-size: 10px; color: #94a3b8; font-style: italic; margin: 3px 0; }
+.timeline-time   { font-size: 9px; color: #94a3b8; margin-top: 4px; }
+.timeline-loading, .timeline-error, .timeline-empty {
+  font-size: 11px;
+  color: #94a3b8;
+  padding: 16px 0;
+  text-align: center;
+}
+.timeline-error { color: #b42318; }
+
+/* ---------------------------------------------------------------------------
+   Form helpers
+   --------------------------------------------------------------------------- */
+.api-error {
+  background: #fef3f2;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  padding: 9px 12px;
+  color: #b42318;
+  font-size: 11px;
+  margin-bottom: 14px;
+}
+.form-intro {
+  margin: 0 0 14px;
+  font-size: 11px;
+  color: #667085;
+  line-height: 1.6;
+}
+
+/* status-pill additions for new follow-up statuses */
+.status-missed    { background: #fef3f2; color: #b42318; }
+.status-cancelled { background: #f2f4f7; color: #667085; }
+

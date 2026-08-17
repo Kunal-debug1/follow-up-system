@@ -1,26 +1,52 @@
 """
-Customers router — customer CRUD and dashboard statistics.
+Customers router — customer CRUD, archive/restore, permanent delete,
+timeline, and dashboard statistics.
 
 All endpoints require authentication (applied at the router level in main.py).
+
+Existing endpoints preserved with identical signatures:
+    GET    /api/customers               — list (now supports ?archived= filter)
+    POST   /api/customers               — create
+    GET    /api/customers/{id}          — get by ID
+    PATCH  /api/customers/{id}          — update (now supports name/phone/email/consumer_number)
+    GET    /api/dashboard/stats         — dashboard statistics
+
+New endpoints:
+    POST   /api/customers/{id}/archive  — soft archive
+    POST   /api/customers/{id}/restore  — restore from archive
+    DELETE /api/customers/{id}          — permanent delete (admin only)
+    GET    /api/customers/{id}/timeline — customer event timeline
 """
 from __future__ import annotations
+
+import os
+from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from ..auth import require_auth
 from ..database import get_db
-from ..models import Customer
+from ..models import CallLog, Customer, Followup
 from ..schemas import (
+    CustomerArchiveOut,
     CustomerCreate,
     CustomerOut,
     CustomerUpdate,
     DashboardStats,
     PaginatedCustomers,
+    TimelineEvent,
 )
 from ..services.customer_service import (
+    AlreadyArchivedError,
     DuplicateError,
+    NotArchivedError,
+    archive_customer,
     create_customer as service_create_customer,
+    delete_customer_permanently,
     get_dashboard_stats,
+    restore_customer,
     update_customer as service_update_customer,
 )
 
@@ -28,6 +54,24 @@ router = APIRouter(tags=["Customers"])
 
 # Maximum allowed page size — prevents accidentally loading the entire table
 _MAX_PAGE_SIZE = 200
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _get_customer_or_404(db: Session, customer_id: int) -> Customer:
+    """Return the customer (active or archived) or raise HTTP 404."""
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return customer
+
+
+def _is_admin(current_user: str) -> bool:
+    """Return True if the authenticated user is the configured admin."""
+    admin_username = os.getenv("CRM_ADMIN_USERNAME", "")
+    return bool(admin_username) and current_user == admin_username
 
 
 # ---------------------------------------------------------------------------
@@ -40,15 +84,22 @@ def list_customers(
     limit: int = Query(default=50, ge=1, le=_MAX_PAGE_SIZE),
     search: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
+    archived: bool = Query(default=False),
     db: Session = Depends(get_db),
 ):
     """
     Return a paginated, searchable list of customers.
 
+    By default only active (non-archived) customers are returned.
+    Pass archived=true to list archived customers instead.
+
     Search matches against: name, phone, email, consumer_number.
     All filtering, sorting, and pagination is performed at the database level.
+
+    BACKWARD COMPATIBLE: archived defaults to False, which preserves
+    the same result set as the previous version of this endpoint.
     """
-    query = db.query(Customer)
+    query = db.query(Customer).filter(Customer.is_archived == archived)
 
     if search:
         term = f"%{search.strip()}%"
@@ -105,11 +156,8 @@ def create_new_customer(payload: CustomerCreate, db: Session = Depends(get_db)):
 
 @router.get("/api/customers/{customer_id}", response_model=CustomerOut)
 def get_customer(customer_id: int, db: Session = Depends(get_db)):
-    """Return a single customer by ID."""
-    customer = db.query(Customer).filter(Customer.id == customer_id).first()
-    if not customer:
-        raise HTTPException(status_code=404, detail="Customer not found")
-    return customer
+    """Return a single customer by ID (active or archived)."""
+    return _get_customer_or_404(db, customer_id)
 
 
 # ---------------------------------------------------------------------------
@@ -126,15 +174,188 @@ def update_customer(
     Update editable fields on an existing customer.
 
     Only fields included in the request body are changed.
-    Supported fields: status, priority, notes, service, address,
-    region, zone, circle, division, subdivision, business_unit.
+    Supported fields: name, phone, email, consumer_number, status, priority,
+    notes, service, address, region, zone, circle, division, subdivision,
+    business_unit.
     """
-    customer = db.query(Customer).filter(Customer.id == customer_id).first()
-    if not customer:
-        raise HTTPException(status_code=404, detail="Customer not found")
-
+    customer = _get_customer_or_404(db, customer_id)
     data = payload.model_dump(exclude_unset=True)
-    return service_update_customer(db, customer, data)
+    try:
+        return service_update_customer(db, customer, data)
+    except DuplicateError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": str(e), "field": e.field},
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Customer archive
+# ---------------------------------------------------------------------------
+
+@router.post("/api/customers/{customer_id}/archive", response_model=CustomerArchiveOut)
+def archive(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: str = Depends(require_auth),
+):
+    """
+    Soft-archive a customer.
+
+    The customer is hidden from normal lists but is never deleted.
+    All call logs and follow-ups are preserved and remain attached.
+    The customer can be restored at any time via the /restore endpoint.
+    """
+    customer = _get_customer_or_404(db, customer_id)
+    try:
+        return archive_customer(db, customer, archived_by=current_user)
+    except AlreadyArchivedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Customer restore
+# ---------------------------------------------------------------------------
+
+@router.post("/api/customers/{customer_id}/restore", response_model=CustomerArchiveOut)
+def restore(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    _current_user: str = Depends(require_auth),
+):
+    """
+    Restore an archived customer to active status.
+
+    The same customer record is reactivated in place.
+    No duplicate is created. All history is retained.
+    """
+    customer = _get_customer_or_404(db, customer_id)
+    try:
+        return restore_customer(db, customer)
+    except NotArchivedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Customer permanent delete (admin only)
+# ---------------------------------------------------------------------------
+
+@router.delete("/api/customers/{customer_id}")
+def delete_customer(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: str = Depends(require_auth),
+):
+    """
+    Permanently delete a customer and all associated data.
+
+    ADMIN ONLY — returns HTTP 403 for non-admin users.
+
+    This action is irreversible. All call logs and follow-ups belonging
+    to this customer will also be permanently deleted (via CASCADE).
+    """
+    if not _is_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permanent deletion requires administrator privileges",
+        )
+
+    customer = _get_customer_or_404(db, customer_id)
+    return delete_customer_permanently(db, customer)
+
+
+# ---------------------------------------------------------------------------
+# Customer timeline
+# ---------------------------------------------------------------------------
+
+@router.get("/api/customers/{customer_id}/timeline", response_model=list[TimelineEvent])
+def customer_timeline(
+    customer_id: int,
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """
+    Return a chronological timeline of events for a customer.
+
+    Events are derived from existing records:
+        - Customer creation event (from Customer.created_at)
+        - Call log entries
+        - Follow-up entries
+
+    No new database table is created — the timeline is computed on the fly.
+    Events are returned newest-first.
+    """
+    customer = _get_customer_or_404(db, customer_id)
+
+    events: list[TimelineEvent] = []
+
+    # --- Customer created event ---
+    events.append(TimelineEvent(
+        event_type="created",
+        timestamp=customer.created_at,
+        title="Customer added",
+        subtitle=f"Customer record created for {customer.name}",
+        event_id=customer.id,
+    ))
+
+    # --- Call log events ---
+    calls = (
+        db.query(CallLog)
+        .filter(CallLog.customer_id == customer_id)
+        .order_by(CallLog.called_at.desc())
+        .limit(limit)
+        .all()
+    )
+    for call in calls:
+        status_label = call.call_status.replace("_", " ").title()
+        events.append(TimelineEvent(
+            event_type="call",
+            timestamp=call.called_at,
+            title=f"Call — {status_label}",
+            subtitle=call.notes,
+            status=call.call_status,
+            event_id=call.id,
+        ))
+
+    # --- Follow-up events ---
+    followups = (
+        db.query(Followup)
+        .filter(Followup.customer_id == customer_id)
+        .order_by(Followup.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    for fu in followups:
+        # Use completed_at for completed follow-ups so the timeline is accurate
+        timestamp = fu.completed_at if fu.completed_at else fu.created_at
+        status_label = fu.status.title()
+        title = f"Follow-up — {status_label}"
+
+        subtitle_parts = []
+        if fu.reason:
+            subtitle_parts.append(fu.reason)
+        scheduled = f"Scheduled: {fu.followup_date}"
+        if fu.followup_time:
+            scheduled += f" {fu.followup_time}"
+        subtitle_parts.append(scheduled)
+
+        events.append(TimelineEvent(
+            event_type="followup",
+            timestamp=timestamp,
+            title=title,
+            subtitle=" · ".join(subtitle_parts) if subtitle_parts else None,
+            outcome=fu.outcome,
+            status=fu.status,
+            notes=fu.notes,
+            event_id=fu.id,
+        ))
+
+    # Sort all events newest-first
+    events.sort(key=lambda e: e.timestamp, reverse=True)
+
+    return events[:limit]
 
 
 # ---------------------------------------------------------------------------

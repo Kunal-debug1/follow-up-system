@@ -102,6 +102,9 @@ function normalizeCustomer(customer) {
 
     status: customer.status ?? "new",
     priority: customer.priority ?? "medium",
+    is_archived: customer.is_archived ?? false,
+    archived_at: customer.archived_at ?? null,
+    archived_by: customer.archived_by ?? null,
   };
 }
 
@@ -119,6 +122,20 @@ function normalizeCustomers(data) {
   }
 
   return [];
+}
+
+/**
+ * Generate a WhatsApp URL for a phone number.
+ * Assumes Indian numbers (10-digit → prepend 91).
+ * Returns null if no valid phone is available.
+ */
+export function whatsappUrl(phone) {
+  if (!phone) return null;
+  const digits = String(phone).replace(/\D/g, "");
+  if (!digits) return null;
+  // Prepend India country code if it's a 10-digit number
+  const normalized = digits.length === 10 ? `91${digits}` : digits;
+  return `https://wa.me/${normalized}`;
 }
 
 async function uploadRequest(path, file, sheet = "") {
@@ -148,10 +165,15 @@ export const api = {
 
   health: () => request("/api/health"),
 
-  customers: async ({ search = "", status = "", page = 1, limit = 50, signal } = {}) => {
+  // ---------------------------------------------------------------------------
+  // Customers
+  // ---------------------------------------------------------------------------
+
+  customers: async ({ search = "", status = "", page = 1, limit = 50, signal, archived = false } = {}) => {
     const params = new URLSearchParams();
     if (search) params.set("search", search);
     if (status) params.set("status", status);
+    if (archived) params.set("archived", "true");
     params.set("page", String(page));
     params.set("limit", String(limit));
     const query = params.toString();
@@ -184,7 +206,33 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  archiveCustomer: (id) =>
+    request(`/api/customers/${id}/archive`, {
+      method: "POST",
+    }),
+
+  restoreCustomer: (id) =>
+    request(`/api/customers/${id}/restore`, {
+      method: "POST",
+    }),
+
+  deleteCustomerPermanently: (id) =>
+    request(`/api/customers/${id}`, {
+      method: "DELETE",
+    }),
+
+  customerTimeline: (id) =>
+    request(`/api/customers/${id}/timeline`),
+
+  // ---------------------------------------------------------------------------
+  // Dashboard
+  // ---------------------------------------------------------------------------
+
   dashboardStats: () => request("/api/dashboard/stats"),
+
+  // ---------------------------------------------------------------------------
+  // Calls
+  // ---------------------------------------------------------------------------
 
   calls: (id, limit = 50) =>
     request(`/api/customers/${id}/calls?limit=${limit}`),
@@ -197,6 +245,10 @@ export const api = {
       },
       body: JSON.stringify(body),
     }),
+
+  // ---------------------------------------------------------------------------
+  // Follow-ups
+  // ---------------------------------------------------------------------------
 
   followups: (id, status = "") => {
     const params = new URLSearchParams();
@@ -237,10 +289,23 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  completeFollowup: (id, body) =>
+    request(`/api/followups/${id}/complete`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    }),
+
   deleteFollowup: (id) =>
     request(`/api/followups/${id}`, {
       method: "DELETE",
     }),
+
+  // ---------------------------------------------------------------------------
+  // Import
+  // ---------------------------------------------------------------------------
 
   importAnalyze: (file, sheet = "") =>
     uploadRequest("/api/import/analyze", file, sheet),
