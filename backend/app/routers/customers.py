@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from ..auth import require_auth
 from ..database import get_db
@@ -117,7 +117,37 @@ def list_customers(
     total = query.count()
     pages = (total + limit - 1) // limit
     offset = (page - 1) * limit
-    items = query.order_by(Customer.id.desc()).offset(offset).limit(limit).all()
+    items = (
+        query.order_by(Customer.id.desc())
+        .options(
+            load_only(
+                Customer.id,
+                Customer.name,
+                Customer.phone,
+                Customer.email,
+                Customer.consumer_number,
+                Customer.service,
+                Customer.address,
+                Customer.region,
+                Customer.zone,
+                Customer.circle,
+                Customer.division,
+                Customer.subdivision,
+                Customer.business_unit,
+                Customer.status,
+                Customer.priority,
+                Customer.notes,
+                Customer.is_archived,
+                Customer.archived_at,
+                Customer.archived_by,
+                Customer.created_at,
+                Customer.updated_at,
+            )
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
     return {
         "items": items,
@@ -304,6 +334,14 @@ def customer_timeline(
     # --- Call log events ---
     calls = (
         db.query(CallLog)
+        .options(
+            load_only(
+                CallLog.id,
+                CallLog.call_status,
+                CallLog.notes,
+                CallLog.called_at,
+            )
+        )
         .filter(CallLog.customer_id == customer_id)
         .order_by(CallLog.called_at.desc())
         .limit(limit)
@@ -323,6 +361,20 @@ def customer_timeline(
     # --- Follow-up events ---
     followups = (
         db.query(Followup)
+        .options(
+            load_only(
+                Followup.id,
+                Followup.followup_date,
+                Followup.followup_time,
+                Followup.status,
+                Followup.outcome,
+                Followup.reason,
+                Followup.notes,
+                Followup.priority,
+                Followup.completed_at,
+                Followup.created_at,
+            )
+        )
         .filter(Followup.customer_id == customer_id)
         .order_by(Followup.created_at.desc())
         .limit(limit)

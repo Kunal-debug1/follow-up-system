@@ -24,6 +24,7 @@ from ..database import get_db
 from ..services.import_service import (
     MAX_SAMPLE_ROWS,
     analyze_file,
+    count_total_rows,
     import_record_batches,
     iter_records,
     preview_file,
@@ -148,9 +149,11 @@ async def analyze(
             results = []
             for current in sheets:
                 analysis = _run_analysis(path, file_type, current)
+                total = count_total_rows(path, file_type, current)
                 results.append({
                     "sheet": current,
-                    "rows": analysis["total_rows"],
+                    "sampled_rows": analysis["sampled_rows"],
+                    "total_rows": total,
                     "valid_records": 0,
                     "header_row": analysis["header_row"],
                     "detected_mapping": analysis["detected_mapping"],
@@ -163,17 +166,19 @@ async def analyze(
                 "mode": "all_sheets",
                 "sheet_results": results,
                 "total_records": sum(
-                    r["rows"] for r in results if r["status"] == "processed"
+                    r["total_rows"] for r in results if r["status"] == "processed"
                 ),
                 "records_with_phone": 0,
                 "records_without_phone": 0,
             }
 
         # Single-sheet mode
-        result = _run_analysis(path, file_type, sheets[0])
+        sheet_name = sheets[0]
+        result = _run_analysis(path, file_type, sheet_name)
+        result["total_rows"] = count_total_rows(path, file_type, sheet_name)
         result.update({
             "sheets": sheets if file_type == "xlsx" else None,
-            "selected_sheet": sheets[0],
+            "selected_sheet": sheet_name,
         })
         return result
 

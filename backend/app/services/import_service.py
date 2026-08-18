@@ -20,13 +20,14 @@ import csv
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
 from time import monotonic
 from typing import Any, Iterable, Iterator
 
 from openpyxl import load_workbook
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from ..models import Customer, ImportBatch
 
@@ -316,8 +317,11 @@ def analyze_file(path: Path, file_type: str, sheet_name: str | None = None) -> d
     Inspect a small sample of the file to detect headers and field mapping.
 
     Intentionally does NOT scan all rows — for a 26,450-row file we only
-    read MAX_HEADER_SCAN_ROWS + MAX_SAMPLE_ROWS rows. The returned
-    `total_rows` is the number of data rows in the sample, not the full file.
+    read MAX_HEADER_SCAN_ROWS + MAX_SAMPLE_ROWS rows.
+
+    Returns `sampled_rows` — the count of data rows observed in the sample
+    window — NOT the full file total.  Call ``count_total_rows`` if the
+    exact row count is required (it scans without loading rows into memory).
     """
     scanned, selected_sheet = _scan_source(path, file_type, sheet_name)
     header_row, headers, mapping = _headers_and_mapping(scanned)
@@ -330,13 +334,56 @@ def analyze_file(path: Path, file_type: str, sheet_name: str | None = None) -> d
     sample_rows = max(0, len(scanned) - header_index - 1)
 
     return {
-        "total_rows": sample_rows,
+        "sampled_rows": sample_rows,
         "columns": headers,
         "header_row": header_row,
         "detected_mapping": mapping,
         "missing_required": [] if "name" in mapping else ["name"],
         "selected_sheet": selected_sheet,
     }
+
+
+def count_total_rows(path: Path, file_type: str, sheet_name: str | None = None) -> int:
+    """
+    Count the total number of data rows in a file **without** loading rows
+    into memory.
+
+    - CSV: counts lines in a single binary pass, subtracting 1 for the header.
+    - XLSX: reads ``worksheet.max_row`` in ``read_only=True`` mode (O(1)
+      metadata read) and subtracts 1 for the header.
+
+    Returns 0 when the file cannot be read or has fewer than 2 rows.
+    """
+    if file_type == "csv":
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                # Single streaming pass — counts lines without building a list
+                return max(0, sum(1 for _ in handle) - 1)
+        except OSError:
+            return 0
+
+    if file_type != "xlsx":
+        return 0
+
+    workbook = None
+    try:
+        workbook = load_workbook(
+            path, read_only=True, data_only=True, keep_links=False
+        )
+        sheets = workbook.sheetnames
+        if sheet_name is None and sheets:
+            sheet_name = sheets[0]
+        if not sheet_name or sheet_name not in sheets:
+            return 0
+        worksheet = workbook[sheet_name]
+        max_row = worksheet.max_row or 0
+        # Subtract 1 for the header row
+        return max(0, max_row - 1)
+    except Exception:
+        return 0
+    finally:
+        if workbook is not None:
+            workbook.close()
 
 
 # ---------------------------------------------------------------------------
@@ -417,8 +464,19 @@ def iter_records(
 # Database helpers
 # ---------------------------------------------------------------------------
 
+# Columns needed when loading existing customers for comparison + bulk update.
+# Limits the SELECT to only what _import_batch / preview_file require,
+# avoiding unnecessary transfer of import_id / source_file / source_row /
+# created_at / updated_at / priority / status / is_archived columns.
+_LOAD_COLUMNS = tuple(getattr(Customer, f) for f in CUSTOMER_FIELDS) + (Customer.id,)
+
+
 def _load_by_consumer(db: Session, values: set[str]) -> dict[str, Customer]:
-    """Batch-fetch customers by consumer_number using chunked IN queries."""
+    """Batch-fetch customers by consumer_number using chunked IN queries.
+
+    Uses ``load_only`` to select just the comparison + update columns
+    instead of hydrating full ORM objects.
+    """
     if not values:
         return {}
     results = {}
@@ -428,6 +486,7 @@ def _load_by_consumer(db: Session, values: set[str]) -> dict[str, Customer]:
         chunk = val_list[i : i + chunk_size]
         for customer in (
             db.query(Customer)
+            .options(load_only(*_LOAD_COLUMNS))
             .filter(Customer.consumer_number.in_(chunk))
             .order_by(Customer.id)
             .all()
@@ -443,6 +502,8 @@ def _load_by_phone_name(db: Session, phones: set[str]) -> dict[tuple[str, str], 
 
     Two customers with the same phone but different names are distinct records
     per the business rule.
+
+    Uses ``load_only`` to select just the comparison + update columns.
     """
     if not phones:
         return {}
@@ -453,6 +514,7 @@ def _load_by_phone_name(db: Session, phones: set[str]) -> dict[tuple[str, str], 
         chunk = phone_list[i : i + chunk_size]
         for customer in (
             db.query(Customer)
+            .options(load_only(*_LOAD_COLUMNS))
             .filter(Customer.phone.in_(chunk))
             .order_by(Customer.id)
             .all()
@@ -584,6 +646,8 @@ def import_record_batches(
     Stream records through the import pipeline in fixed-size batches.
 
     Memory usage: O(IMPORT_BATCH_SIZE), not O(total_rows).
+    Duplicate detection is batch-local (bounded sets) plus a database
+    IN query per batch — no unbounded Python sets across the entire file.
 
     Returns import statistics.
     """
@@ -604,8 +668,6 @@ def import_record_batches(
     duplicates = 0
     skipped = 0
     total = 0
-    seen_consumers: set[str] = set()
-    seen_fallback: set[tuple[str, str]] = set()
 
     try:
         pending: list[dict] = []
@@ -614,7 +676,7 @@ def import_record_batches(
             pending.append(record)
 
             if len(pending) >= IMPORT_BATCH_SIZE:
-                counts = _import_batch(db, batch, pending, seen_consumers, seen_fallback)
+                counts = _import_batch(db, batch, pending)
                 total += len(pending)
                 imported += counts[0]
                 updated += counts[1]
@@ -624,7 +686,7 @@ def import_record_batches(
 
         # Flush remaining records
         if pending:
-            counts = _import_batch(db, batch, pending, seen_consumers, seen_fallback)
+            counts = _import_batch(db, batch, pending)
             total += len(pending)
             imported += counts[0]
             updated += counts[1]
@@ -668,11 +730,20 @@ def _import_batch(
     db: Session,
     batch: ImportBatch,
     records: list[dict],
-    seen_consumers: set[str],
-    seen_fallback: set[tuple[str, str]],
 ) -> tuple[int, int, int, int]:
     """
     Process one batch of records: deduplicate, upsert, and commit.
+
+    Duplicate detection strategy:
+      - Within-batch: a batch-local set catches duplicate consumer_numbers
+        and (phone, normalized_name) pairs.  Bounded to the batch size.
+      - Cross-batch / database: ``_load_by_consumer`` and
+        ``_load_by_phone_name`` query existing records.  A match means the
+        record already exists (from a prior batch) → treated as UPDATE.
+
+    Bulk operations:
+      - New rows: ``bulk_insert_mappings`` (single multi-row INSERT).
+      - Updated rows: ``bulk_update_mappings`` (Core UPDATEs).
 
     Returns (imported, updated, duplicates, skipped).
     """
@@ -695,27 +766,32 @@ def _import_batch(
     duplicates = 0
     skipped = 0
 
-    # Track every Customer object touched in this batch (both newly created
-    # and loaded existing ones) so we can expunge them after commit.
-    # This keeps the SQLAlchemy session identity map bounded to ~batch size
-    # regardless of total import rows (25k–100k+). The ImportBatch object
-    # stays attached so the caller can persist the final status/counters.
-    touched: set[Customer] = set()
+    # Batch-local dedup sets — bounded to O(batch_size), never O(total_rows).
+    batch_seen_consumers: set[str] = set()
+    batch_seen_fallback: set[tuple[str, str]] = set()
+
+    new_maps: list[dict] = []
+    update_maps: list[dict] = []
+    now = datetime.now(timezone.utc)
 
     try:
         for record in records:
             consumer = record.get("consumer_number")
             key = (record.get("phone") or "", normalize_column(record["name"]))
 
-            # Cross-batch duplicate detection
-            if consumer and consumer in seen_consumers:
-                duplicates += 1
-                continue
-            if not consumer and record.get("phone") and key in seen_fallback:
-                duplicates += 1
-                continue
+            # --- Within-batch duplicate detection (batch-local sets) ---
+            if consumer:
+                if consumer in batch_seen_consumers:
+                    duplicates += 1
+                    continue
+                batch_seen_consumers.add(consumer)
+            elif record.get("phone"):
+                if key in batch_seen_fallback:
+                    duplicates += 1
+                    continue
+                batch_seen_fallback.add(key)
 
-            # Resolve existing record
+            # --- Resolve existing record (database lookup) ---
             if consumer:
                 existing = by_consumer.get(consumer)
             elif record.get("phone"):
@@ -723,47 +799,55 @@ def _import_batch(
             else:
                 existing = None
 
-            # Register identifiers to prevent within-batch duplicates on retry
-            if consumer:
-                seen_consumers.add(consumer)
-            elif record.get("phone"):
-                seen_fallback.add(key)
-
             if existing:
-                touched.add(existing)
-                # Upsert: update changed fields, skip if nothing changed
-                changed = 0
+                # Build update dict with only changed fields.
+                # Preserve rule: existing non-empty values are not overwritten
+                # by blank import values (record.get(field) is falsy → skipped).
+                update_data: dict[str, Any] = {"id": existing.id}
+                changed = False
                 for field in CUSTOMER_FIELDS:
                     if record.get(field) and getattr(existing, field) != record[field]:
-                        setattr(existing, field, record[field])
-                        changed += 1
+                        update_data[field] = record[field]
+                        changed = True
+                update_data["updated_at"] = now
                 if changed:
+                    update_maps.append(update_data)
                     updated += 1
                 else:
                     skipped += 1
                 continue
 
-            # New customer
-            customer = Customer(
-                **{field: record.get(field) for field in CUSTOMER_FIELDS},
-                import_id=batch.id,
-                source_file=batch.filename,
-                source_row=record["source_row"],
-            )
-            db.add(customer)
-            touched.add(customer)
+            # --- New customer ---
+            new_map: dict[str, Any] = {
+                field: record.get(field) for field in CUSTOMER_FIELDS
+            }
+            new_map["import_id"] = batch.id
+            new_map["source_file"] = batch.filename
+            new_map["source_row"] = record["source_row"]
+            new_map["priority"] = "medium"
+            new_map["status"] = "new"
+            new_map["is_archived"] = False
+            new_map["created_at"] = now
+            new_map["updated_at"] = now
+            new_maps.append(new_map)
             imported += 1
 
-        db.commit()
+        # --- Bulk insert new records (single multi-row INSERT) ---
+        if new_maps:
+            db.bulk_insert_mappings(Customer, new_maps)
 
-        # Release all touched Customer objects from the session identity map.
-        # The ImportBatch object must remain attached so the caller can
-        # update its final status/counters.
-        for customer in touched:
-            db.expunge(customer)
+        # --- Bulk update existing records (Core UPDATEs) ---
+        if update_maps:
+            db.bulk_update_mappings(Customer, update_maps)
+
+        db.commit()
 
     except Exception:
         db.rollback()
         raise
+
+    # Clear batch-local references so memory stays O(IMPORT_BATCH_SIZE).
+    new_maps.clear()
+    update_maps.clear()
 
     return imported, updated, duplicates, skipped
