@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Phone, Plus, Search, ChevronRight, Archive } from "lucide-react";
 import { EmptyState } from "./common/EmptyState";
 import { StatusPill } from "./common/StatusPill";
@@ -7,7 +8,7 @@ import { displayPhone } from "../utils/formatters";
 const PRIORITY_LABELS = { high: "High", medium: "Medium", low: "Low" };
 const PRIORITY_CLASS = { high: "priority-high", medium: "priority-medium", low: "priority-low" };
 
-function CustomerTable({ customers, onCustomer }) {
+const CustomerTable = memo(function CustomerTable({ customers, onCustomer }) {
   return (
     <div className="table-wrap">
       <table>
@@ -69,7 +70,7 @@ function CustomerTable({ customers, onCustomer }) {
       </table>
     </div>
   );
-}
+});
 
 export function CustomersPage({
   customers,

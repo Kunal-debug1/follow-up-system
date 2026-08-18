@@ -23,7 +23,7 @@ New endpoint:
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -41,6 +41,7 @@ from ..schemas import (
     FollowupOut,
     FollowupUpdate,
 )
+from ..utils.timezone import business_today
 
 router = APIRouter(tags=["CRM Follow-ups"])
 
@@ -140,7 +141,7 @@ def create_followup(
     """
     _get_customer_or_404(db, customer_id)
 
-    if payload.followup_date < date.today():
+    if payload.followup_date < business_today():
         raise HTTPException(
             status_code=400,
             detail="Follow-up date cannot be in the past",
@@ -220,7 +221,7 @@ def todays_followups(
     Each result includes customer_name from a JOIN so the UI can display
     who needs a callback instead of 'Customer #1234'.
     """
-    today_str = date.today().isoformat()
+    today_str = business_today().isoformat()
     rows = (
         db.query(
             Followup,
@@ -255,7 +256,7 @@ def upcoming_followups(
     in the upcoming view (matching the frontend display logic).
     Each result includes customer_name from a JOIN.
     """
-    start = date.today()
+    start = business_today()
     end = start + timedelta(days=days)
     rows = (
         db.query(
@@ -285,7 +286,7 @@ def overdue_followups(
     db: Session = Depends(get_db),
 ):
     """Return follow-ups whose date is strictly before today, with customer name."""
-    today_str = date.today().isoformat()
+    today_str = business_today().isoformat()
     rows = (
         db.query(
             Followup,
@@ -356,7 +357,7 @@ def complete_followup(
                 status_code=400,
                 detail="next_date is required when create_next is true",
             )
-        if payload.next_date < date.today():
+        if payload.next_date < business_today():
             raise HTTPException(
                 status_code=400,
                 detail="Next follow-up date cannot be in the past",
@@ -405,7 +406,7 @@ def update_followup(
     data = payload.model_dump(exclude_unset=True)
 
     if "followup_date" in data and data["followup_date"] is not None:
-        if data["followup_date"] < date.today():
+        if data["followup_date"] < business_today():
             raise HTTPException(
                 status_code=400,
                 detail="Follow-up date cannot be in the past",

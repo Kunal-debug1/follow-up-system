@@ -19,6 +19,7 @@ from time import monotonic
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
+from ..core.config import MAX_UPLOAD_BYTES
 from ..database import get_db
 from ..services.import_service import (
     MAX_SAMPLE_ROWS,
@@ -31,13 +32,6 @@ from ..services.import_service import (
 
 router = APIRouter(prefix="/api/import", tags=["Import"])
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-import os
-MAX_UPLOAD_BYTES: int = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
 
 
 # ---------------------------------------------------------------------------

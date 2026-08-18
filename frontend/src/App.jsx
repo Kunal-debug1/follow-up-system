@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Bell,
   CalendarClock,
@@ -267,7 +267,7 @@ function App() {
   // Customer handlers
   // ---------------------------------------------------------------------------
 
-  const openCustomer = async (customer) => {
+  const openCustomer = useCallback(async (customer) => {
     try {
       const [fullCustomer, calls, followups] = await Promise.all([
         api.customer(customer.id),
@@ -280,9 +280,9 @@ function App() {
     } catch (err) {
       setError(err.message);
     }
-  };
+  }, []);
 
-  const closeCustomer = () => {
+  const closeCustomer = useCallback(() => {
     setSelectedCustomer(null);
     setCallModal(false);
     setFollowupModal(false);
@@ -290,7 +290,7 @@ function App() {
     setArchiveConfirm(false);
     setRestoreConfirm(false);
     setDeleteConfirm(false);
-  };
+  }, []);
 
   const handleCustomerCreated = async () => {
     setCustomerModal(false);

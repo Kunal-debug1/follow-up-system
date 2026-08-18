@@ -2,7 +2,7 @@
 Import service — streaming Excel/CSV import for the CRM.
 
 Architecture:
-    Upload → validate → stream workbook → normalize one row → batch 250 →
+    Upload → validate → stream workbook → normalize one row → batch 500 →
     database insert/upsert → commit → clear batch → continue
 
 Memory model:
@@ -40,7 +40,7 @@ MAX_WORKSHEET_ROWS: int = int(os.getenv("MAX_WORKSHEET_ROWS", "50000"))
 MAX_COLUMNS: int = 80
 MAX_HEADER_SCAN_ROWS: int = 30
 MAX_SAMPLE_ROWS: int = 100
-IMPORT_BATCH_SIZE: int = int(os.getenv("IMPORT_BATCH_SIZE", "250"))
+IMPORT_BATCH_SIZE: int = int(os.getenv("IMPORT_BATCH_SIZE", "500"))
 
 # ---------------------------------------------------------------------------
 # Column alias mapping — canonical field → accepted header variants
@@ -418,19 +418,23 @@ def iter_records(
 # ---------------------------------------------------------------------------
 
 def _load_by_consumer(db: Session, values: set[str]) -> dict[str, Customer]:
-    """Batch-fetch customers by consumer_number using a single IN query."""
+    """Batch-fetch customers by consumer_number using chunked IN queries."""
     if not values:
         return {}
-    return {
-        customer.consumer_number: customer
+    results = {}
+    val_list = list(values)
+    chunk_size = 500
+    for i in range(0, len(val_list), chunk_size):
+        chunk = val_list[i : i + chunk_size]
         for customer in (
             db.query(Customer)
-            .filter(Customer.consumer_number.in_(values))
+            .filter(Customer.consumer_number.in_(chunk))
             .order_by(Customer.id)
             .all()
-        )
-        if customer.consumer_number
-    }
+        ):
+            if customer.consumer_number:
+                results[customer.consumer_number] = customer
+    return results
 
 
 def _load_by_phone_name(db: Session, phones: set[str]) -> dict[tuple[str, str], Customer]:
@@ -442,16 +446,20 @@ def _load_by_phone_name(db: Session, phones: set[str]) -> dict[tuple[str, str], 
     """
     if not phones:
         return {}
-    return {
-        (customer.phone, normalize_column(customer.name)): customer
+    results = {}
+    phone_list = list(phones)
+    chunk_size = 500
+    for i in range(0, len(phone_list), chunk_size):
+        chunk = phone_list[i : i + chunk_size]
         for customer in (
             db.query(Customer)
-            .filter(Customer.phone.in_(phones))
+            .filter(Customer.phone.in_(chunk))
             .order_by(Customer.id)
             .all()
-        )
-        if customer.phone
-    }
+        ):
+            if customer.phone:
+                results[(customer.phone, normalize_column(customer.name))] = customer
+    return results
 
 
 def _has_updates(customer: Customer, record: dict) -> bool:
@@ -687,6 +695,13 @@ def _import_batch(
     duplicates = 0
     skipped = 0
 
+    # Track every Customer object touched in this batch (both newly created
+    # and loaded existing ones) so we can expunge them after commit.
+    # This keeps the SQLAlchemy session identity map bounded to ~batch size
+    # regardless of total import rows (25k–100k+). The ImportBatch object
+    # stays attached so the caller can persist the final status/counters.
+    touched: set[Customer] = set()
+
     try:
         for record in records:
             consumer = record.get("consumer_number")
@@ -715,6 +730,7 @@ def _import_batch(
                 seen_fallback.add(key)
 
             if existing:
+                touched.add(existing)
                 # Upsert: update changed fields, skip if nothing changed
                 changed = 0
                 for field in CUSTOMER_FIELDS:
@@ -735,9 +751,16 @@ def _import_batch(
                 source_row=record["source_row"],
             )
             db.add(customer)
+            touched.add(customer)
             imported += 1
 
         db.commit()
+
+        # Release all touched Customer objects from the session identity map.
+        # The ImportBatch object must remain attached so the caller can
+        # update its final status/counters.
+        for customer in touched:
+            db.expunge(customer)
 
     except Exception:
         db.rollback()

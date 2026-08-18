@@ -1,8 +1,9 @@
+import { memo } from "react";
 import { CalendarClock, ChevronRight, Users, Clock3, AlertCircle, CheckCircle2 } from "lucide-react";
 import { EmptyState } from "./common/EmptyState";
 import { formatDate } from "../utils/formatters";
 
-function StatCard({ icon: Icon, label, value }) {
+const StatCard = memo(function StatCard({ icon: Icon, label, value }) {
   return (
     <div className="stat-card">
       <div className="stat-icon"><Icon size={19} /></div>
@@ -12,9 +13,9 @@ function StatCard({ icon: Icon, label, value }) {
       </div>
     </div>
   );
-}
+});
 
-function FollowupList({ items, onCustomer, onComplete }) {
+const FollowupList = memo(function FollowupList({ items, onCustomer, onComplete }) {
   return (
     <div className="followup-list">
       {items.map((item) => (
@@ -45,7 +46,7 @@ function FollowupList({ items, onCustomer, onComplete }) {
       ))}
     </div>
   );
-}
+});
 
 export function Dashboard({ loading, stats, today, upcoming, customers, onCustomer, onFollowups }) {
   return (

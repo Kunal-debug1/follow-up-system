@@ -2,7 +2,11 @@ import re
 from typing import Any
 
 def normalize_phone(value: Any) -> str | None:
-    """Normalize phone numbers. Handle None, NaN, floats ending in .0, +91 prefix, leading 0, etc. Return 10-digit string or None."""
+    """
+    Normalize phone numbers.
+    Handles None, NaN, floats ending in .0, +91 prefix, leading 0, spaces, dashes.
+    Returns a clean string of digits or None.
+    """
     if value is None:
         return None
     text = str(value).strip()
@@ -14,13 +18,11 @@ def normalize_phone(value: Any) -> str | None:
     digits = re.sub(r'\D', '', text)
     if not digits or digits == '0' or all(c == '0' for c in digits):
         return None
-    if len(digits) == 10:
-        return digits
     if len(digits) == 12 and digits.startswith('91'):
-        return digits[2:]
-    if len(digits) == 11 and digits.startswith('0'):
-        return digits[1:]
-    return digits if len(digits) >= 7 else None
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith('0'):
+        digits = digits[1:]
+    return digits if len(digits) >= 7 and len(digits) <= 15 else None
 
 def normalize_email(value: Any) -> str | None:
     if value is None:

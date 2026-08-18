@@ -139,11 +139,15 @@ class CallLog(Base):
 
 Index("idx_customers_phone", Customer.phone)
 Index("idx_customers_consumer_number", Customer.consumer_number)
+Index("idx_customers_email", Customer.email)                        # migration 0002
+Index("idx_customers_priority", Customer.priority)                  # migration 0002
+Index("idx_customers_created_at", Customer.created_at)              # migration 0002
 Index("idx_customers_status", Customer.status)
 Index("idx_customers_name", Customer.name)
 Index("idx_customers_import_id", Customer.import_id)
-Index("idx_customers_is_archived", Customer.is_archived)          # new (0003)
+Index("idx_customers_is_archived", Customer.is_archived)            # migration 0003
 Index("idx_followups_date", Followup.followup_date)
+Index("idx_followups_status", Followup.status)                      # migration 0002
 Index(
     "idx_followups_status_date_time",
     Followup.status,
@@ -158,7 +162,7 @@ Index(
     Followup.followup_date,
     Followup.followup_time,
 )
-Index("idx_followups_outcome", Followup.outcome)                   # new (0004)
-Index("idx_followups_priority", Followup.priority)                 # new (0004)
+Index("idx_followups_outcome", Followup.outcome)                     # migration 0004
+Index("idx_followups_priority", Followup.priority)                   # migration 0004
 Index("idx_call_logs_customer", CallLog.customer_id)
 Index("idx_call_logs_called_at", CallLog.called_at)

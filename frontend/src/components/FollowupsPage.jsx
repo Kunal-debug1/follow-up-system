@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { CalendarClock, CheckCircle2 } from "lucide-react";
 import { EmptyState } from "./common/EmptyState";
 import { formatDate } from "../utils/formatters";
@@ -17,7 +18,7 @@ const PRIORITY_CLASS = {
   low: "priority-low",
 };
 
-function FollowupRow({ item, onCustomer, onComplete }) {
+const FollowupRow = memo(function FollowupRow({ item, onCustomer, onComplete }) {
   return (
     <div className="followup-row">
       <div className="time-block">
@@ -56,9 +57,9 @@ function FollowupRow({ item, onCustomer, onComplete }) {
       </div>
     </div>
   );
-}
+});
 
-function FollowupSection({ title, subtitle, items, onCustomer, onComplete, accentClass }) {
+const FollowupSection = memo(function FollowupSection({ title, subtitle, items, onCustomer, onComplete, accentClass }) {
   return (
     <div className={`card followup-section-card ${accentClass || ""}`}>
       <div className="section-heading">
@@ -79,7 +80,7 @@ function FollowupSection({ title, subtitle, items, onCustomer, onComplete, accen
       </div>
     </div>
   );
-}
+});
 
 export function FollowupsPage({ overdue, today, upcoming, onCustomer, onComplete }) {
   return (

@@ -19,15 +19,15 @@ Permanent delete rules:
 """
 from __future__ import annotations
 
-import os
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, timezone
 
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models import CallLog, Customer, Followup
 from ..utils.normalization import normalize_consumer_number, normalize_email, normalize_phone
+from ..utils.timezone import business_start_of_day, business_end_of_day, business_today
 
 
 # ---------------------------------------------------------------------------
@@ -309,42 +309,42 @@ def get_dashboard_stats(db: Session) -> dict:
     """
     Return aggregated CRM statistics using database-level COUNT queries.
 
-    All counts are computed in a single round-trip per query — no Python-side
-    filtering or aggregation is performed.
+    Follow-up statistics are computed in a single combined query with conditional
+    aggregation, reducing roundtrips.
 
     Archived customers are excluded from total_customers.
     """
-    today = date.today()
+    today = business_today()
     today_str = today.isoformat()
-    # Naive UTC midnight boundaries — consistent with how timestamps are stored
-    start_of_day_naive = datetime.combine(today, time.min)
-    start_of_tomorrow_naive = start_of_day_naive + timedelta(days=1)
+    # Business day boundaries in UTC — consistent with how timestamps are stored
+    start_of_day = business_start_of_day()
+    start_of_tomorrow = business_end_of_day()
 
-    # Only count active (non-archived) customers
+    # 1. Total active customers count (indexed on is_archived)
     total_customers: int = db.query(func.count(Customer.id)).filter(
         Customer.is_archived == False  # noqa: E712
-    ).scalar()
+    ).scalar() or 0
 
-    today_followups: int = db.query(func.count(Followup.id)).filter(
-        Followup.followup_date == today_str,
-        Followup.status == "pending",
-    ).scalar()
+    # 2. Combined follow-up counts for today, overdue, and upcoming in 1 query
+    fu_row = (
+        db.query(
+            func.count(case((Followup.followup_date == today_str, Followup.id))),
+            func.count(case((Followup.followup_date < today_str, Followup.id))),
+            func.count(case((Followup.followup_date > today_str, Followup.id))),
+        )
+        .filter(Followup.status == "pending")
+        .first()
+    )
 
-    overdue_followups: int = db.query(func.count(Followup.id)).filter(
-        Followup.followup_date < today_str,
-        Followup.status == "pending",
-    ).scalar()
+    today_followups: int = fu_row[0] if fu_row else 0
+    overdue_followups: int = fu_row[1] if fu_row else 0
+    upcoming_followups: int = fu_row[2] if fu_row else 0
 
-    # upcoming = strictly after today (today is counted separately above)
-    upcoming_followups: int = db.query(func.count(Followup.id)).filter(
-        Followup.followup_date > today_str,
-        Followup.status == "pending",
-    ).scalar()
-
+    # 3. Calls today count (indexed on called_at)
     calls_today: int = db.query(func.count(CallLog.id)).filter(
-        CallLog.called_at >= start_of_day_naive,
-        CallLog.called_at < start_of_tomorrow_naive,
-    ).scalar()
+        CallLog.called_at >= start_of_day,
+        CallLog.called_at < start_of_tomorrow,
+    ).scalar() or 0
 
     return {
         "total_customers": total_customers,

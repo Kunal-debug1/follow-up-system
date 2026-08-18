@@ -218,3 +218,77 @@ def test_duplicate_contacts_are_not_inserted_twice():
         assert result["duplicate_rows"] == 1
     finally:
         db.close()
+
+
+def test_batch_upsert_updates_existing_record():
+    Base.metadata.create_all(engine)
+    db = SessionLocal()
+    try:
+        # First import
+        result1 = import_record_batches(
+            db,
+            "file1.xlsx",
+            "xlsx",
+            iter((
+                {
+                    "name": "Update Customer", "phone": "9876543299", "email": "old@example.com",
+                    "service": "Old Service", "consumer_number": "UP-100", "address": "Old Address",
+                    "region": None, "zone": None, "circle": None,
+                    "division": None, "subdivision": None, "business_unit": None,
+                    "source_row": 2,
+                },
+            )),
+        )
+        assert result1["imported_rows"] == 1
+
+        # Second import with new service & email
+        result2 = import_record_batches(
+            db,
+            "file2.xlsx",
+            "xlsx",
+            iter((
+                {
+                    "name": "Update Customer", "phone": "9876543299", "email": "new@example.com",
+                    "service": "New Service", "consumer_number": "UP-100", "address": "Old Address",
+                    "region": None, "zone": None, "circle": None,
+                    "division": None, "subdivision": None, "business_unit": None,
+                    "source_row": 2,
+                },
+            )),
+        )
+        assert result2["updated_rows"] == 1
+        assert result2["imported_rows"] == 0
+    finally:
+        db.close()
+
+
+def test_multi_sheet_workbook_handling():
+    handle = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+    handle.close()
+    workbook = Workbook()
+    sheet1 = workbook.active
+    sheet1.title = "Region North"
+    sheet1.append(["Consumer Name", "Contact No"])
+    sheet1.append(["North User 1", "9876540001"])
+
+    sheet2 = workbook.create_sheet(title="Region South")
+    sheet2.append(["Consumer Name", "Contact No"])
+    sheet2.append(["South User 1", "9876540002"])
+
+    workbook.save(handle.name)
+    workbook.close()
+    path = Path(handle.name)
+    try:
+        sheets = workbook_sheets(path)
+        assert len(sheets) == 2
+        assert "Region North" in sheets
+        assert "Region South" in sheets
+
+        analysis1 = analyze_file(path, "xlsx", "Region North")
+        assert analysis1["detected_mapping"]["name"] == "Consumer Name"
+
+        analysis2 = analyze_file(path, "xlsx", "Region South")
+        assert analysis2["detected_mapping"]["name"] == "Consumer Name"
+    finally:
+        path.unlink(missing_ok=True)
+
