@@ -2,13 +2,19 @@
 Pydantic schemas for request validation and response serialisation.
 
 All schemas use Pydantic v2 syntax (model_config, ConfigDict, etc.).
+
+Timezone strategy:
+    All datetime fields in response schemas are serialised with UTC offset
+    (e.g. "2026-08-18T05:00:00+00:00"). JavaScript Date() will parse these
+    correctly as UTC and convert to the browser's local timezone (IST) for
+    display. Never manually add/subtract hours.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -66,6 +72,15 @@ class CustomerOut(BaseModel):
     archived_by: str | None = None
     created_at: datetime
     updated_at: datetime
+
+    @field_serializer("created_at", "updated_at", "archived_at")
+    def serialize_dt(self, v: Optional[datetime]) -> Optional[str]:
+        """Ensure all datetimes are serialised as UTC ISO-8601 with +00:00."""
+        if v is None:
+            return None
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.isoformat()
 
 
 class CustomerCreate(BaseModel):
@@ -143,6 +158,15 @@ class TimelineEvent(BaseModel):
     notes: str | None = None
     event_id: int | None = None  # the id of the underlying call/followup record
 
+    @field_serializer("timestamp")
+    def serialize_timestamp(self, v: datetime) -> str:
+        """Ensure timestamp is serialised as UTC ISO-8601 with +00:00."""
+        if v is None:
+            return None
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.isoformat()
+
 
 # ---------------------------------------------------------------------------
 # Dashboard
@@ -177,6 +201,39 @@ class CallLogOut(BaseModel):
     call_status: str
     notes: Optional[str]
     called_at: datetime
+
+    @field_serializer("called_at")
+    def serialize_called_at(self, v: datetime) -> str:
+        """Ensure called_at is serialised as UTC ISO-8601 with Z suffix."""
+        if v is None:
+            return None
+        if v.tzinfo is None:
+            # Stored as naive UTC — attach UTC tzinfo before serialising
+            v = v.replace(tzinfo=timezone.utc)
+        return v.isoformat()
+
+
+class CallLogWithCustomer(BaseModel):
+    """Extended call log that includes the customer name and phone — used by
+    the /api/calls/recent endpoint so CallsPage can display meaningful info."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    customer_id: int
+    customer_name: str
+    customer_phone: Optional[str] = None
+    call_status: str
+    notes: Optional[str]
+    called_at: datetime
+
+    @field_serializer("called_at")
+    def serialize_called_at(self, v: datetime) -> str:
+        """Ensure called_at is serialised as UTC ISO-8601 with Z suffix."""
+        if v is None:
+            return None
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +283,9 @@ class FollowupOut(BaseModel):
 
     id: int
     customer_id: int
+    # customer_name is populated by JOIN queries in the router layer;
+    # it is absent from direct ORM results so we default to None.
+    customer_name: Optional[str] = None
     followup_date: str
     followup_time: Optional[str]
     status: str
@@ -236,6 +296,15 @@ class FollowupOut(BaseModel):
     completed_at: Optional[datetime] = None
     completed_by: Optional[str] = None
     created_at: datetime
+
+    @field_serializer("completed_at", "created_at")
+    def serialize_dt(self, v: Optional[datetime]) -> Optional[str]:
+        """Ensure all datetimes are serialised as UTC ISO-8601 with +00:00."""
+        if v is None:
+            return None
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.isoformat()
 
 
 class CompleteFollowupOut(BaseModel):

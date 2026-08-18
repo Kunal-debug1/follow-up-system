@@ -23,7 +23,7 @@ New endpoint:
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -86,7 +86,7 @@ def create_call_log(
         customer_id=customer_id,
         call_status=payload.call_status.strip(),
         notes=payload.notes,
-        called_at=datetime.utcnow(),
+        called_at=datetime.now(timezone.utc),
     )
     db.add(call)
     try:
@@ -171,7 +171,7 @@ def create_followup(
         reason=payload.reason,
         notes=payload.notes,
         priority=payload.priority,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
     db.add(followup)
     try:
@@ -215,10 +215,18 @@ def todays_followups(
     status: str = Query(default="pending"),
     db: Session = Depends(get_db),
 ):
-    """Return follow-ups scheduled for today, ordered by time."""
+    """Return follow-ups scheduled for today, ordered by time.
+
+    Each result includes customer_name from a JOIN so the UI can display
+    who needs a callback instead of 'Customer #1234'.
+    """
     today_str = date.today().isoformat()
-    return (
-        db.query(Followup)
+    rows = (
+        db.query(
+            Followup,
+            Customer.name.label("customer_name"),
+        )
+        .join(Customer, Followup.customer_id == Customer.id)
         .filter(
             Followup.followup_date == today_str,
             Followup.status == status,
@@ -226,6 +234,12 @@ def todays_followups(
         .order_by(Followup.followup_time.asc(), Followup.id.asc())
         .all()
     )
+    result = []
+    for followup, customer_name in rows:
+        out = FollowupOut.model_validate(followup)
+        out.customer_name = customer_name
+        result.append(out)
+    return result
 
 
 @router.get("/api/followups/upcoming", response_model=list[FollowupOut])
@@ -239,11 +253,16 @@ def upcoming_followups(
 
     The range is inclusive of today so that today's follow-ups also appear
     in the upcoming view (matching the frontend display logic).
+    Each result includes customer_name from a JOIN.
     """
     start = date.today()
     end = start + timedelta(days=days)
-    return (
-        db.query(Followup)
+    rows = (
+        db.query(
+            Followup,
+            Customer.name.label("customer_name"),
+        )
+        .join(Customer, Followup.customer_id == Customer.id)
         .filter(
             Followup.followup_date >= start.isoformat(),
             Followup.followup_date <= end.isoformat(),
@@ -252,6 +271,12 @@ def upcoming_followups(
         .order_by(Followup.followup_date.asc(), Followup.followup_time.asc())
         .all()
     )
+    result = []
+    for followup, customer_name in rows:
+        out = FollowupOut.model_validate(followup)
+        out.customer_name = customer_name
+        result.append(out)
+    return result
 
 
 @router.get("/api/followups/overdue", response_model=list[FollowupOut])
@@ -259,10 +284,14 @@ def overdue_followups(
     status: str = Query(default="pending"),
     db: Session = Depends(get_db),
 ):
-    """Return follow-ups whose date is strictly before today."""
+    """Return follow-ups whose date is strictly before today, with customer name."""
     today_str = date.today().isoformat()
-    return (
-        db.query(Followup)
+    rows = (
+        db.query(
+            Followup,
+            Customer.name.label("customer_name"),
+        )
+        .join(Customer, Followup.customer_id == Customer.id)
         .filter(
             Followup.followup_date < today_str,
             Followup.status == status,
@@ -270,6 +299,12 @@ def overdue_followups(
         .order_by(Followup.followup_date.asc())
         .all()
     )
+    result = []
+    for followup, customer_name in rows:
+        out = FollowupOut.model_validate(followup)
+        out.customer_name = customer_name
+        result.append(out)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +337,7 @@ def complete_followup(
             detail=f"Cannot complete a follow-up with status '{followup.status}'",
         )
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     # Mark the follow-up as completed
     followup.status = "completed"
@@ -334,7 +369,7 @@ def complete_followup(
             status="pending",
             reason=payload.next_reason or followup.reason,
             priority=followup.priority,
-            created_at=now,
+            created_at=datetime.now(timezone.utc),
         )
         db.add(next_followup)
 

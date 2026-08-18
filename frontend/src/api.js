@@ -237,6 +237,10 @@ export const api = {
   calls: (id, limit = 50) =>
     request(`/api/customers/${id}/calls?limit=${limit}`),
 
+  // All recent calls across ALL customers (for the Call History page)
+  recentCalls: (limit = 50) =>
+    request(`/api/calls/recent?limit=${limit}`),
+
   createCall: (id, body) =>
     request(`/api/customers/${id}/calls`, {
       method: "POST",

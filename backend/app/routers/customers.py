@@ -30,6 +30,7 @@ from ..auth import require_auth
 from ..database import get_db
 from ..models import CallLog, Customer, Followup
 from ..schemas import (
+    CallLogWithCustomer,
     CustomerArchiveOut,
     CustomerCreate,
     CustomerOut,
@@ -356,6 +357,55 @@ def customer_timeline(
     events.sort(key=lambda e: e.timestamp, reverse=True)
 
     return events[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Recent calls (global view) — powers the Call History page
+# ---------------------------------------------------------------------------
+
+@router.get("/api/calls/recent", response_model=list[CallLogWithCustomer])
+def recent_calls(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """
+    Return the most recent call logs across ALL customers, newest first.
+
+    Each entry includes the customer name and phone so the Call History page
+    can display meaningful information without extra requests.
+
+    BUSINESS RULE: This endpoint returns only REAL call log records.
+    It never returns customers that have no call history. Creating a customer
+    NEVER creates a call log — so a brand-new customer will NOT appear here.
+    """
+    rows = (
+        db.query(
+            CallLog.id,
+            CallLog.customer_id,
+            Customer.name.label("customer_name"),
+            Customer.phone.label("customer_phone"),
+            CallLog.call_status,
+            CallLog.notes,
+            CallLog.called_at,
+        )
+        .join(Customer, CallLog.customer_id == Customer.id)
+        .order_by(CallLog.called_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return [
+        CallLogWithCustomer(
+            id=row.id,
+            customer_id=row.customer_id,
+            customer_name=row.customer_name,
+            customer_phone=row.customer_phone,
+            call_status=row.call_status,
+            notes=row.notes,
+            called_at=row.called_at,
+        )
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

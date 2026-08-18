@@ -88,6 +88,9 @@ function App() {
   const [overdue, setOverdue] = useState([]);
   const [stats, setStats] = useState(EMPTY_STATS);
 
+  // Recent calls for Call History page
+  const [recentCalls, setRecentCalls] = useState([]);
+
   // Customer detail state
   const [selectedCustomer, setSelectedCustomer] = useState(null);
   const [customerCalls, setCustomerCalls] = useState([]);
@@ -165,6 +168,18 @@ function App() {
     }
   };
 
+  const loadRecentCalls = async () => {
+    try {
+      setLoading(true);
+      const data = await api.recentCalls(50); // Get top 50 recent calls
+      setRecentCalls(data);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const loadCustomers = async (searchTerm = "", p = 1, limit = pageLimit, archived = showArchived) => {
     customerRequestRef.current?.abort();
     const controller = new AbortController();
@@ -213,6 +228,8 @@ function App() {
     if (!isAuthenticated) return;
     if (activePage === "dashboard" || activePage === "followups") {
       loadOverview();
+    } else if (activePage === "calls") {
+      loadRecentCalls();
     }
   }, [activePage, isAuthenticated]);
 
@@ -373,6 +390,19 @@ function App() {
       setError(err.message);
     } finally {
       setSaving(false);
+    }
+  };
+
+  // Called when WhatsApp button is clicked in CustomerDrawer
+  const handleWhatsAppLogged = async () => {
+    if (!selectedCustomer) return;
+    try {
+      const calls = await api.calls(selectedCustomer.id);
+      setCustomerCalls(calls);
+      refreshTimeline();
+      await loadOverview();
+    } catch {
+      // Non-critical refresh — ignore failures silently
     }
   };
 
@@ -589,7 +619,7 @@ function App() {
         )}
 
         {activePage === "calls" && (
-          <CallsPage customers={customers} onCustomer={openCustomer} />
+          <CallsPage calls={recentCalls} onCustomer={openCustomer} />
         )}
 
         {activePage === "import" && <ImportPage />}
@@ -609,6 +639,7 @@ function App() {
             onRestore={() => setRestoreConfirm(true)}
             onPermanentDelete={() => setDeleteConfirm(true)}
             timelineRefreshKey={timelineRefreshKey}
+            onWhatsAppLogged={handleWhatsAppLogged}
           />
         )}
 

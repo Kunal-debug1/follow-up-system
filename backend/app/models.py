@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -20,7 +23,7 @@ class ImportBatch(Base):
     duplicate_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime, default=utc_now, nullable=False
     )
 
     customers: Mapped[list["Customer"]] = relationship(
@@ -57,12 +60,12 @@ class Customer(Base):
     source_file: Mapped[str | None] = mapped_column(String(255))
     source_row: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime, default=utc_now, nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=utc_now,
+        onupdate=utc_now,
         nullable=False,
     )
 
@@ -96,7 +99,7 @@ class Followup(Base):
     reason: Mapped[str | None] = mapped_column(String(255))
     notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime, default=utc_now, nullable=False
     )
 
     # ---------------------------------------------------------------------------
@@ -126,7 +129,7 @@ class CallLog(Base):
     )
     notes: Mapped[str | None] = mapped_column(Text)
     called_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime, default=utc_now, nullable=False
     )
 
 

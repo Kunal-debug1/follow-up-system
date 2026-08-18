@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import {
   Phone,
   Plus,
@@ -14,7 +14,7 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { formatDate } from "../utils/formatters";
-import { whatsappUrl } from "../api";
+import { api, whatsappUrl } from "../api";
 import { CustomerTimeline } from "./CustomerTimeline";
 
 // Priority badge colors
@@ -61,10 +61,37 @@ export function CustomerDrawer({
   onRestore,
   onPermanentDelete,
   timelineRefreshKey,
+  onWhatsAppLogged,
 }) {
   const [showTimeline, setShowTimeline] = useState(false);
+  // Prevent duplicate WhatsApp activity records on double-click
+  const whatsappLoggingRef = useRef(false);
 
   const waUrl = whatsappUrl(customer.phone);
+
+  /**
+   * Record a WhatsApp activity when the user intentionally clicks the button.
+   * We fire-and-forget the API call — the WhatsApp link still opens regardless.
+   * A ref guard ensures only one record is created even on rapid double-clicks.
+   */
+  const handleWhatsAppClick = async () => {
+    if (!customer.id || whatsappLoggingRef.current) return;
+    whatsappLoggingRef.current = true;
+    try {
+      await api.createCall(customer.id, {
+        call_status: "whatsapp",
+        notes: null,
+      });
+      // Notify parent so it can refresh call history and timeline
+      if (onWhatsAppLogged) onWhatsAppLogged();
+    } catch {
+      // Non-critical — WhatsApp still opens; log silently
+      console.warn("WhatsApp activity could not be recorded.");
+    } finally {
+      // Allow re-recording after a short cooldown (e.g. if they reopen)
+      setTimeout(() => { whatsappLoggingRef.current = false; }, 5000);
+    }
+  };
 
   return (
     <div className="drawer-layer">
@@ -101,6 +128,7 @@ export function CustomerDrawer({
               target="_blank"
               rel="noopener noreferrer"
               title="Open WhatsApp"
+              onClick={handleWhatsAppClick}
             >
               <MessageCircle size={17} />
               WhatsApp

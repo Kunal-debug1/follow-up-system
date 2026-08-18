@@ -35,7 +35,7 @@ function FollowupList({ items, onCustomer, onComplete }) {
           {onComplete && (
             <button
               className="complete-button"
-              onClick={() => onComplete(item.id)}
+              onClick={() => onComplete(item)}
               title="Mark completed"
             >
               <CheckCircle2 size={18} />

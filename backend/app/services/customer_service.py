@@ -20,7 +20,7 @@ Permanent delete rules:
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -99,7 +99,7 @@ def create_customer(db: Session, data: dict) -> Customer:
                 field="phone",
             )
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     customer = Customer(
         name=name,
         phone=phone,
@@ -202,7 +202,7 @@ def update_customer(db: Session, customer: Customer, data: dict) -> Customer:
         if field in data and data[field] is not None:
             setattr(customer, field, data[field])
 
-    customer.updated_at = datetime.utcnow()
+    customer.updated_at = datetime.now(timezone.utc)
 
     try:
         db.commit()
@@ -232,9 +232,9 @@ def archive_customer(db: Session, customer: Customer, archived_by: str) -> Custo
         )
 
     customer.is_archived = True
-    customer.archived_at = datetime.utcnow()
+    customer.archived_at = datetime.now(timezone.utc)
     customer.archived_by = archived_by
-    customer.updated_at = datetime.utcnow()
+    customer.updated_at = datetime.now(timezone.utc)
 
     try:
         db.commit()
@@ -262,7 +262,7 @@ def restore_customer(db: Session, customer: Customer) -> Customer:
     customer.is_archived = False
     customer.archived_at = None
     customer.archived_by = None
-    customer.updated_at = datetime.utcnow()
+    customer.updated_at = datetime.now(timezone.utc)
 
     try:
         db.commit()
@@ -316,8 +316,9 @@ def get_dashboard_stats(db: Session) -> dict:
     """
     today = date.today()
     today_str = today.isoformat()
-    start_of_day = datetime.combine(today, time.min)
-    start_of_tomorrow = start_of_day + timedelta(days=1)
+    # Naive UTC midnight boundaries — consistent with how timestamps are stored
+    start_of_day_naive = datetime.combine(today, time.min)
+    start_of_tomorrow_naive = start_of_day_naive + timedelta(days=1)
 
     # Only count active (non-archived) customers
     total_customers: int = db.query(func.count(Customer.id)).filter(
@@ -341,8 +342,8 @@ def get_dashboard_stats(db: Session) -> dict:
     ).scalar()
 
     calls_today: int = db.query(func.count(CallLog.id)).filter(
-        CallLog.called_at >= start_of_day,
-        CallLog.called_at < start_of_tomorrow,
+        CallLog.called_at >= start_of_day_naive,
+        CallLog.called_at < start_of_tomorrow_naive,
     ).scalar()
 
     return {
