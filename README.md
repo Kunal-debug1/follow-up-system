@@ -30,35 +30,41 @@ React + Vite ──HTTP──> FastAPI ──SQLAlchemy──> PostgreSQL
 
 ## Run locally
 
-Requirements: Python 3.11+ and Node.js.
+Requirements: Python 3.11+, Node.js, and a local PostgreSQL database.
 
-1. Create a local PostgreSQL database.
-2. Create a root `.env` from `.env.example` and fill in the values. Use a local database URL, local frontend origin in `CORS_ORIGINS`, and development-only admin credentials and auth secret. Do not use production secrets locally or commit `.env`.
-3. Start the backend:
+Set the backend environment variables in your terminal. These are examples for PowerShell; use the equivalent `export NAME=value` syntax in Bash. Never use production secrets for local development.
 
-```bash
+```powershell
+$env:DATABASE_URL = "postgresql+psycopg://USER:PASSWORD@localhost:5432/crm"
+$env:CRM_ADMIN_USERNAME = "admin"
+$env:CRM_ADMIN_PASSWORD = "change-this-local-password"
+$env:CRM_AUTH_SECRET = "replace-with-a-long-random-local-secret"
+$env:CORS_ORIGINS = "http://localhost:5173"
+```
+
+Start the backend:
+
+```powershell
 cd backend
 python -m venv .venv
-# Windows: .venv\\Scripts\\Activate.ps1
-# macOS/Linux: source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-4. In another terminal, install and start the frontend:
+In another terminal, install and start the frontend:
 
-```bash
+```powershell
 cd frontend
 npm ci
+$env:VITE_API_URL = "http://127.0.0.1:8000"
 npm run dev
 ```
 
-Set `VITE_API_URL` to the local API URL if it differs from the frontend's configured default. The API's interactive documentation is available at `/docs`; liveness and database readiness are available at `/health` and `/health/ready`.
+The API's interactive documentation is available at `/docs`; liveness and database readiness are available at `/health` and `/health/ready`. The required and optional environment variable names are listed in [`.env.example`](.env.example); the app reads them from the process environment.
 
 ## Configuration
-
-The application reads configuration from environment variables. See [`.env.example`](.env.example) for the full list.
 
 | Variable | Purpose |
 | --- | --- |
@@ -96,7 +102,7 @@ render.yaml
 
 ## Testing
 
-Backend tests and a frontend production build are part of the project workflow. Run the commands documented in the repository's test configuration before submitting changes.
+Backend tests and a frontend production build are included in the repository. Run the project's configured checks before submitting changes.
 
 ## Project status
 
